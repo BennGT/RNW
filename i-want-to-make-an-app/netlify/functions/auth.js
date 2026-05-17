@@ -8,28 +8,28 @@ const headers = {
 const sessionDays = 30;
 
 exports.handler = async (event) => {
-  if (event.httpMethod === "OPTIONS") {
-    return json(204, {});
-  }
-
-  const store = await getBlobStore("marshal-auth");
-
-  if (event.httpMethod === "GET") {
-    const users = await getUsers(store);
-    const user = await getAuthenticatedUser(store, event.headers.authorization || event.headers.Authorization);
-
-    return json(200, {
-      user,
-      setupRequired: users.length === 0,
-      users: user?.role === "admin" ? publicUsers(users) : [],
-    });
-  }
-
-  if (event.httpMethod !== "POST") {
-    return json(405, { error: "Method not allowed" });
-  }
-
   try {
+    if (event.httpMethod === "OPTIONS") {
+      return json(204, {});
+    }
+
+    const store = await getBlobStore("marshal-auth");
+
+    if (event.httpMethod === "GET") {
+      const users = await getUsers(store);
+      const user = await getAuthenticatedUser(store, event.headers.authorization || event.headers.Authorization);
+
+      return json(200, {
+        user,
+        setupRequired: users.length === 0,
+        users: user?.role === "admin" ? publicUsers(users) : [],
+      });
+    }
+
+    if (event.httpMethod !== "POST") {
+      return json(405, { error: "Method not allowed" });
+    }
+
     const body = JSON.parse(event.body || "{}");
     const action = body.action;
 
@@ -62,7 +62,12 @@ exports.handler = async (event) => {
 
     return json(400, { error: "Unknown action" });
   } catch (error) {
-    return json(400, { error: error.message });
+    console.error(error);
+    return json(500, {
+      error: "Auth function failed",
+      detail: error.message,
+      name: error.name,
+    });
   }
 };
 

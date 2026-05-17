@@ -1283,7 +1283,7 @@ async function authRequest(body = null, method = "POST") {
     }
 
     if (response.status === 500 || response.status === 502) {
-      throw new Error("Sign-in service errored. Check Netlify Function logs.");
+      throw new Error(payload.detail || payload.error || "Sign-in service errored. Check Netlify Function logs.");
     }
 
     throw new Error(payload.error || "Sign-in request failed");

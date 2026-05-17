@@ -4,29 +4,29 @@ const headers = {
 };
 
 exports.handler = async (event) => {
-  if (event.httpMethod === "OPTIONS") {
-    return {
-      statusCode: 204,
-      headers,
-      body: "",
-    };
-  }
+  try {
+    if (event.httpMethod === "OPTIONS") {
+      return {
+        statusCode: 204,
+        headers,
+        body: "",
+      };
+    }
 
-  const store = await getBlobStore("marshal");
-  const authStore = await getBlobStore("marshal-auth");
-  const user = await getAuthenticatedUser(authStore, event.headers.authorization || event.headers.Authorization);
+    const store = await getBlobStore("marshal");
+    const authStore = await getBlobStore("marshal-auth");
+    const user = await getAuthenticatedUser(authStore, event.headers.authorization || event.headers.Authorization);
 
-  if (!user) {
-    return json(401, { error: "Sign in required" });
-  }
+    if (!user) {
+      return json(401, { error: "Sign in required" });
+    }
 
-  if (event.httpMethod === "GET") {
-    const data = await store.get("shared-data", { type: "json" });
-    return json(200, { data: data || null });
-  }
+    if (event.httpMethod === "GET") {
+      const data = await store.get("shared-data", { type: "json" });
+      return json(200, { data: data || null });
+    }
 
-  if (event.httpMethod === "POST") {
-    try {
+    if (event.httpMethod === "POST") {
       const payload = JSON.parse(event.body || "{}");
       const data = payload.data || payload;
 
@@ -40,12 +40,17 @@ exports.handler = async (event) => {
       });
 
       return json(200, { ok: true });
-    } catch (error) {
-      return json(400, { error: error.message });
     }
-  }
 
-  return json(405, { error: "Method not allowed" });
+    return json(405, { error: "Method not allowed" });
+  } catch (error) {
+    console.error(error);
+    return json(500, {
+      error: "Data function failed",
+      detail: error.message,
+      name: error.name,
+    });
+  }
 };
 
 async function getAuthenticatedUser(store, authHeader) {
