@@ -7,7 +7,7 @@ Open `index.html` in a browser to run it locally. When hosted on Netlify with Fu
 ## Included
 
 - Today dashboard with coverage, open shifts, pending requests, and weekly roster totals.
-- Weekly schedule with create, edit, and delete shift actions.
+- Weekly schedule with create, edit, delete, copy, and paste shift actions.
 - Team message channels for announcements, operations, and managers.
 - Staff directory with add, edit, and delete employee actions.
 - Simple leave, availability, and shift-swap requests with editable statuses.

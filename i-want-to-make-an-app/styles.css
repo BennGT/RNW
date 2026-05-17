@@ -530,6 +530,16 @@ h3 {
   flex-wrap: wrap;
 }
 
+.copy-banner {
+  padding: 10px 12px;
+  border: 1px solid #c7d8ff;
+  border-radius: 8px;
+  background: var(--blue-soft);
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 800;
+}
+
 .week-grid {
   display: grid;
   grid-template-columns: repeat(7, minmax(160px, 1fr));
@@ -548,6 +558,10 @@ h3 {
 .day-head {
   position: sticky;
   top: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
   padding: 12px;
   border-bottom: 1px solid var(--line);
   background: #fbfcfc;
@@ -564,6 +578,17 @@ h3 {
   color: var(--muted);
   font-size: 12px;
   font-weight: 700;
+}
+
+.mini-button {
+  min-height: 28px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0 8px;
+  background: #ffffff;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 900;
 }
 
 .day-column.today {
@@ -585,6 +610,26 @@ h3 {
   border-radius: 8px;
   background: #ffffff;
   text-align: left;
+}
+
+.schedule-shift-head,
+.shift-card-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.shift-card-actions {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  margin-top: 2px;
+}
+
+.shift-card-actions .ghost-button {
+  min-height: 30px;
+  padding: 0 10px;
+  font-size: 12px;
 }
 
 .schedule-shift strong {

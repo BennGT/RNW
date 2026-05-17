@@ -7,6 +7,7 @@ const state = {
   weekStart: startOfWeek(new Date()),
   editingShiftId: null,
   editingEmployeeId: null,
+  copiedShift: null,
   deferredInstallPrompt: null,
   cloudStatus: "local",
   cloudSaveTimer: null,
@@ -218,6 +219,14 @@ function bindViewEvents() {
 
   appView.querySelectorAll("[data-shift-id]").forEach((button) => {
     button.addEventListener("click", () => openShiftModal(button.dataset.shiftId));
+  });
+
+  appView.querySelectorAll("[data-copy-shift-id]").forEach((button) => {
+    button.addEventListener("click", () => copyShift(button.dataset.copyShiftId));
+  });
+
+  appView.querySelectorAll("[data-paste-shift-date]").forEach((button) => {
+    button.addEventListener("click", () => pasteShift(button.dataset.pasteShiftDate));
   });
 
   appView.querySelectorAll("[data-week]").forEach((button) => {
@@ -483,6 +492,7 @@ function renderDashboard() {
 function renderSchedule() {
   const days = Array.from({ length: 7 }, (_, index) => addDays(state.weekStart, index));
   const rangeLabel = `${formatDateShort(days[0])} to ${formatDateShort(days[6])}`;
+  const copiedEmployee = state.copiedShift ? findEmployee(state.copiedShift.employeeId) : null;
 
   return `
     <div class="schedule-layout">
@@ -495,6 +505,14 @@ function renderSchedule() {
         <button class="primary-button" data-action="new-shift" type="button">New shift</button>
       </div>
 
+      ${
+        state.copiedShift
+          ? `<div class="copy-banner">
+              Copied ${copiedEmployee.name}, ${state.copiedShift.start} to ${state.copiedShift.end}. Choose Paste on a day.
+            </div>`
+          : ""
+      }
+
       <div class="week-grid">
         ${days
           .map((day) => {
@@ -503,8 +521,11 @@ function renderSchedule() {
             return `
               <section class="day-column ${key === toDateKey(new Date()) ? "today" : ""}">
                 <div class="day-head">
-                  <strong>${formatWeekday(day)}</strong>
-                  <span>${formatDateShort(day)}</span>
+                  <div>
+                    <strong>${formatWeekday(day)}</strong>
+                    <span>${formatDateShort(day)}</span>
+                  </div>
+                  ${state.copiedShift ? `<button class="mini-button" data-paste-shift-date="${key}" type="button">Paste</button>` : ""}
                 </div>
                 <div class="day-shifts">
                   ${
@@ -728,12 +749,18 @@ function renderScheduleShift(shift) {
   const employee = findEmployee(shift.employeeId);
   const className = shift.status.toLowerCase();
   return `
-    <button class="schedule-shift ${className}" style="border-left-color: ${areaColors[shift.area] || "#276ef1"}" data-shift-id="${shift.id}" type="button">
-      <strong>${shift.start} to ${shift.end}</strong>
+    <article class="schedule-shift ${className}" style="border-left-color: ${areaColors[shift.area] || "#276ef1"}">
+      <div class="schedule-shift-head">
+        <strong>${shift.start} to ${shift.end}</strong>
+        ${statusPill(shift.status)}
+      </div>
       <span>${employee.name}</span>
       <span>${shift.area}</span>
-      ${statusPill(shift.status)}
-    </button>
+      <div class="shift-card-actions">
+        <button class="ghost-button" data-shift-id="${shift.id}" type="button">Edit</button>
+        <button class="ghost-button" data-copy-shift-id="${shift.id}" type="button">Copy</button>
+      </div>
+    </article>
   `;
 }
 
@@ -899,6 +926,40 @@ function closeShiftModal() {
   shiftModal.classList.add("hidden");
   state.editingShiftId = null;
   shiftForm.reset();
+}
+
+function copyShift(shiftId) {
+  const shift = state.data.shifts.find((item) => item.id === shiftId);
+  if (!shift) return;
+
+  state.copiedShift = {
+    employeeId: shift.employeeId,
+    start: shift.start,
+    end: shift.end,
+    area: shift.area,
+    status: shift.status,
+    notes: shift.notes || "",
+  };
+
+  const employee = findEmployee(shift.employeeId);
+  syncSaveStatus(`Copied ${employee.name} shift`);
+  render();
+}
+
+function pasteShift(date) {
+  if (!state.copiedShift) return;
+
+  const pastedShift = {
+    ...state.copiedShift,
+    id: crypto.randomUUID(),
+    date,
+  };
+
+  state.data.shifts.push(pastedShift);
+  saveData();
+  notifyTeam("Shift pasted", `${findEmployee(pastedShift.employeeId).name}: ${formatDateShort(parseDateKey(date))}, ${pastedShift.start} to ${pastedShift.end}`);
+  syncSaveStatus("Shift pasted");
+  render();
 }
 
 function openEmployeeModal(employeeId = null) {
