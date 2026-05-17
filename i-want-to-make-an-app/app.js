@@ -1162,7 +1162,7 @@ async function initAuth() {
   } catch (error) {
     state.authUser = null;
     state.setupRequired = false;
-    authError.textContent = "Could not connect to sign in.";
+    authError.textContent = error.message || "Could not connect to sign in.";
     syncAuthScreen();
     console.error(error);
   }
@@ -1277,7 +1277,18 @@ async function authRequest(body = null, method = "POST") {
 
   const response = await fetch(authApiPath, options);
   const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload.error || "Request failed");
+  if (!response.ok) {
+    if (response.status === 404) {
+      throw new Error("Sign-in service is not deployed. Check Netlify Functions.");
+    }
+
+    if (response.status === 500 || response.status === 502) {
+      throw new Error("Sign-in service errored. Check Netlify Function logs.");
+    }
+
+    throw new Error(payload.error || "Sign-in request failed");
+  }
+
   return payload;
 }
 

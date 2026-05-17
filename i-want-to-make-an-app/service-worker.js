@@ -1,4 +1,4 @@
-const cacheName = "marshal-app-v5";
+const cacheName = "marshal-app-v6";
 const appShell = [
   "./",
   "./index.html",
