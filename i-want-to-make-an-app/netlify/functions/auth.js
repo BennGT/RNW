@@ -1,5 +1,4 @@
 const crypto = require("crypto");
-const { getStore } = require("@netlify/blobs");
 
 const headers = {
   "Content-Type": "application/json",
@@ -13,7 +12,7 @@ exports.handler = async (event) => {
     return json(204, {});
   }
 
-  const store = getStore("marshal-auth");
+  const store = await getBlobStore("marshal-auth");
 
   if (event.httpMethod === "GET") {
     const users = await getUsers(store);
@@ -215,4 +214,9 @@ function json(statusCode, body) {
     headers,
     body: JSON.stringify(body),
   };
+}
+
+async function getBlobStore(name) {
+  const { getStore } = await import("@netlify/blobs");
+  return getStore(name);
 }

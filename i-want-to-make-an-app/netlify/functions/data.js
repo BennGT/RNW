@@ -1,5 +1,3 @@
-const { getStore } = require("@netlify/blobs");
-
 const headers = {
   "Content-Type": "application/json",
   "Cache-Control": "no-store",
@@ -14,8 +12,8 @@ exports.handler = async (event) => {
     };
   }
 
-  const store = getStore("marshal");
-  const authStore = getStore("marshal-auth");
+  const store = await getBlobStore("marshal");
+  const authStore = await getBlobStore("marshal-auth");
   const user = await getAuthenticatedUser(authStore, event.headers.authorization || event.headers.Authorization);
 
   if (!user) {
@@ -83,4 +81,9 @@ function json(statusCode, body) {
     headers,
     body: JSON.stringify(body),
   };
+}
+
+async function getBlobStore(name) {
+  const { getStore } = await import("@netlify/blobs");
+  return getStore(name);
 }
