@@ -15,6 +15,12 @@ exports.handler = async (event) => {
   }
 
   const store = getStore("marshal");
+  const authStore = getStore("marshal-auth");
+  const user = await getAuthenticatedUser(authStore, event.headers.authorization || event.headers.Authorization);
+
+  if (!user) {
+    return json(401, { error: "Sign in required" });
+  }
 
   if (event.httpMethod === "GET") {
     const data = await store.get("shared-data", { type: "json" });
@@ -43,6 +49,33 @@ exports.handler = async (event) => {
 
   return json(405, { error: "Method not allowed" });
 };
+
+async function getAuthenticatedUser(store, authHeader) {
+  const token = readBearerToken(authHeader);
+  if (!token) return null;
+
+  const session = await store.get(`session:${token}`, { type: "json" });
+  if (!session || new Date(session.expiresAt) < new Date()) {
+    await store.delete(`session:${token}`).catch(() => {});
+    return null;
+  }
+
+  const users = (await store.get("users", { type: "json" })) || [];
+  const user = users.find((item) => item.id === session.userId);
+  if (!user) return null;
+
+  return {
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    role: user.role,
+  };
+}
+
+function readBearerToken(authHeader) {
+  if (!authHeader || !authHeader.startsWith("Bearer ")) return null;
+  return authHeader.slice("Bearer ".length).trim();
+}
 
 function json(statusCode, body) {
   return {

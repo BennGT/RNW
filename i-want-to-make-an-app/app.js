@@ -1,6 +1,8 @@
 const storageKey = "marshal-data-v1";
+const authTokenKey = "marshal-auth-token";
 const legacyStorageKeys = ["shiftlink-demo-v1"];
 const cloudApiPath = "/.netlify/functions/data";
+const authApiPath = "/.netlify/functions/auth";
 
 const state = {
   view: "dashboard",
@@ -12,6 +14,10 @@ const state = {
   cloudStatus: "local",
   cloudSaveTimer: null,
   localChangedDuringCloudLoad: false,
+  authToken: localStorage.getItem(authTokenKey),
+  authUser: null,
+  authUsers: [],
+  setupRequired: false,
   data: loadData(),
 };
 
@@ -24,10 +30,10 @@ const views = {
 };
 
 const areaColors = {
-  "Front counter": "#276ef1",
-  Dispatch: "#087f72",
-  Warehouse: "#9a6700",
-  "Customer support": "#b42318",
+  General: "#276ef1",
+  Landscaping: "#087f72",
+  Maintenance: "#9a6700",
+  Construction: "#b42318",
   Admin: "#6b7280",
 };
 
@@ -39,9 +45,18 @@ const brandName = document.querySelector("#brandName");
 const brandSubtitle = document.querySelector("#brandSubtitle");
 const userSelect = document.querySelector("#userSelect");
 const saveStatus = document.querySelector("#saveStatus");
+const accountStatus = document.querySelector("#accountStatus");
+const signOutButton = document.querySelector("#signOutButton");
 const installAppButton = document.querySelector("#installAppButton");
 const notificationButton = document.querySelector("#notificationButton");
 const backupFileInput = document.querySelector("#backupFileInput");
+const authScreen = document.querySelector("#authScreen");
+const authForm = document.querySelector("#authForm");
+const authTitle = document.querySelector("#authTitle");
+const authIntro = document.querySelector("#authIntro");
+const authNameField = document.querySelector("#authNameField");
+const authError = document.querySelector("#authError");
+const authSubmitButton = document.querySelector("#authSubmitButton");
 const shiftModal = document.querySelector("#shiftModal");
 const shiftForm = document.querySelector("#shiftForm");
 const deleteShiftButton = document.querySelector("#deleteShiftButton");
@@ -61,7 +76,7 @@ function init() {
   registerServiceWorker();
   bindChrome();
   render();
-  loadCloudData();
+  initAuth();
 }
 
 function bindChrome() {
@@ -73,13 +88,13 @@ function bindChrome() {
   });
 
   userSelect.addEventListener("change", () => {
-    state.data.currentUserId = userSelect.value;
+    state.data.currentUserId = userSelect.value || null;
     saveData();
     render();
   });
 
   document.querySelector("#seedReset").addEventListener("click", () => {
-    if (typeof confirm === "function" && !confirm("Reset demo data? This will replace saved staff, schedules, messages, setup changes, and hosted shared data.")) return;
+    if (typeof confirm === "function" && !confirm("Clear all saved Marshal data? This will remove staff, schedules, messages, requests, setup changes, and hosted shared data.")) return;
     localStorage.removeItem(storageKey);
     legacyStorageKeys.forEach((key) => localStorage.removeItem(key));
     state.data = createSeedData();
@@ -91,6 +106,8 @@ function bindChrome() {
   });
 
   backupFileInput.addEventListener("change", importBackup);
+  authForm.addEventListener("submit", submitAuth);
+  signOutButton.addEventListener("click", signOut);
   installAppButton.addEventListener("click", installApp);
   notificationButton.addEventListener("click", requestNotifications);
 
@@ -117,6 +134,11 @@ function bindChrome() {
 
   shiftForm.addEventListener("submit", (event) => {
     event.preventDefault();
+    if (!state.data.employees.length) {
+      syncSaveStatus("Add an employee before creating shifts", true);
+      return;
+    }
+
     const formData = new FormData(shiftForm);
     const shift = Object.fromEntries(formData.entries());
     shift.id = state.editingShiftId || crypto.randomUUID();
@@ -177,14 +199,14 @@ function bindChrome() {
   });
 
   deleteEmployeeButton.addEventListener("click", () => {
-    if (!state.editingEmployeeId || state.data.employees.length <= 1) return;
+    if (!state.editingEmployeeId) return;
     const employee = findEmployee(state.editingEmployeeId);
     if (typeof confirm === "function" && !confirm(`Delete ${employee.name}? Their shifts, messages, and requests will also be removed.`)) return;
     state.data.employees = state.data.employees.filter((item) => item.id !== state.editingEmployeeId);
     state.data.shifts = state.data.shifts.filter((shift) => shift.employeeId !== state.editingEmployeeId);
     state.data.requests = state.data.requests.filter((request) => request.employeeId !== state.editingEmployeeId);
     state.data.messages = state.data.messages.filter((message) => message.employeeId !== state.editingEmployeeId);
-    state.data.currentUserId = state.data.employees[0].id;
+    state.data.currentUserId = state.data.employees[0]?.id || null;
     saveData();
     notifyTeam("Employee removed", employee.name);
     hydrateUserSelect();
@@ -269,6 +291,10 @@ function bindViewEvents() {
     button.addEventListener("click", () => notifyTeam("Marshal notifications are on", "Schedule and message alerts can appear on this device.", true));
   });
 
+  appView.querySelectorAll("[data-delete-account-id]").forEach((button) => {
+    button.addEventListener("click", () => deleteAccount(button.dataset.deleteAccountId));
+  });
+
   appView.querySelectorAll("[data-employee-id]").forEach((button) => {
     button.addEventListener("click", () => openEmployeeModal(button.dataset.employeeId));
   });
@@ -314,6 +340,11 @@ function bindViewEvents() {
   if (messageForm) {
     messageForm.addEventListener("submit", (event) => {
       event.preventDefault();
+      if (!state.data.currentUserId) {
+        syncSaveStatus("Add an employee before sending messages", true);
+        return;
+      }
+
       const input = messageForm.querySelector("input");
       const text = input.value.trim();
       if (!text) return;
@@ -335,6 +366,11 @@ function bindViewEvents() {
   if (requestForm) {
     requestForm.addEventListener("submit", (event) => {
       event.preventDefault();
+      if (!state.data.currentUserId) {
+        syncSaveStatus("Add an employee before submitting requests", true);
+        return;
+      }
+
       const formData = new FormData(requestForm);
       state.data.requests.unshift({
         id: crypto.randomUUID(),
@@ -409,13 +445,18 @@ function bindViewEvents() {
       render();
     });
   });
+
+  const accountForm = appView.querySelector("#accountForm");
+  if (accountForm) {
+    accountForm.addEventListener("submit", createAccount);
+  }
 }
 
 function renderDashboard() {
   const currentUser = getCurrentUser();
   const todayKey = toDateKey(new Date());
   const todayShifts = shiftsForDate(todayKey);
-  const currentShift = todayShifts.find((shift) => shift.employeeId === currentUser.id);
+  const currentShift = currentUser.id ? todayShifts.find((shift) => shift.employeeId === currentUser.id) : null;
   const openShifts = state.data.shifts.filter((shift) => shift.status === "Open").length;
   const pendingRequests = state.data.requests.filter((request) => request.status === "Pending").length;
   const weekEnd = toDateKey(addDays(state.weekStart, 7));
@@ -454,8 +495,8 @@ function renderDashboard() {
           <div class="highlight-row">
             <div>
               <span class="highlight-label">My shift today</span>
-              <h2>${currentUser.name}</h2>
-              <p>${currentShift ? `${currentShift.area}, ${currentShift.start} to ${currentShift.end}` : "No shift assigned today"}</p>
+              <h2>${currentUser.id ? currentUser.name : "No employee selected"}</h2>
+              <p>${currentUser.id ? (currentShift ? `${currentShift.area}, ${currentShift.start} to ${currentShift.end}` : "No shift assigned today") : "Add employees from the Staff page."}</p>
             </div>
             ${currentShift ? statusPill(currentShift.status) : statusPill("Open")}
           </div>
@@ -568,11 +609,11 @@ function renderMessages() {
           <p>${channel.description}</p>
         </div>
         <div class="message-list">
-          ${messages.map(renderMessage).join("")}
+          ${messages.length ? messages.map(renderMessage).join("") : `<div class="empty-state">No messages yet.</div>`}
         </div>
         <form class="message-compose" id="messageForm">
-          <input type="text" placeholder="Write a message" aria-label="Message" autocomplete="off" />
-          <button class="primary-button" type="submit">Send</button>
+          <input type="text" placeholder="${state.data.currentUserId ? "Write a message" : "Add an employee before messaging"}" aria-label="Message" autocomplete="off" ${state.data.currentUserId ? "" : "disabled"} />
+          <button class="primary-button" type="submit" ${state.data.currentUserId ? "" : "disabled"}>Send</button>
         </form>
       </div>
     </section>
@@ -624,7 +665,7 @@ function renderStaff() {
           <button class="ghost-button" data-action="new-employee" type="button">Add employee</button>
         </div>
         <div class="panel-body staff-list">
-          ${state.data.employees.map(renderStaffItem).join("")}
+          ${state.data.employees.length ? state.data.employees.map(renderStaffItem).join("") : `<div class="empty-state">No employees yet. Add your first employee to start building the roster.</div>`}
         </div>
       </section>
     </div>
@@ -660,7 +701,7 @@ function renderSetup() {
         <div class="panel-head">
           <div>
             <h2 class="panel-title">Work areas</h2>
-            <p class="panel-subtitle">Areas feed employee teams and shift locations</p>
+            <p class="panel-subtitle">Areas feed shift locations</p>
           </div>
         </div>
         <div class="panel-body">
@@ -719,6 +760,34 @@ function renderSetup() {
           <button class="ghost-button" data-action="test-notification" type="button">Send test</button>
         </div>
       </section>
+
+      ${
+        state.authUser?.role === "admin"
+          ? `<section class="panel wide-panel">
+              <div class="panel-head">
+                <div>
+                  <h2 class="panel-title">Login accounts</h2>
+                  <p class="panel-subtitle">Create email and password access for employees</p>
+                </div>
+              </div>
+              <div class="panel-body">
+                <form class="inline-form account-form" id="accountForm">
+                  <input name="name" type="text" placeholder="Name" aria-label="Name" required />
+                  <input name="email" type="email" placeholder="Email" aria-label="Email" required />
+                  <input name="password" type="password" placeholder="Password" aria-label="Password" minlength="8" required />
+                  <select name="role" aria-label="Role">
+                    <option value="employee">Employee</option>
+                    <option value="admin">Admin</option>
+                  </select>
+                  <button class="primary-button" type="submit">Add account</button>
+                </form>
+                <div class="config-list">
+                  ${state.authUsers.length ? state.authUsers.map(renderAccountRow).join("") : `<div class="empty-state">No login accounts loaded.</div>`}
+                </div>
+              </div>
+            </section>`
+          : ""
+      }
     </div>
   `;
 }
@@ -830,8 +899,7 @@ function renderStaffItem(employee) {
         ${statusPill(employee.status)}
       </div>
       <div class="staff-meta">
-        <span>${employee.team}</span>
-        <span>${employee.phone}</span>
+        <span>${employee.phone || "No phone saved"}</span>
       </div>
       <div class="staff-meta">
         <span>${nextShift ? `${formatDateShort(parseDateKey(nextShift.date))}, ${nextShift.start}` : "No upcoming shift"}</span>
@@ -876,6 +944,18 @@ function renderChannelRow(channel) {
   `;
 }
 
+function renderAccountRow(user) {
+  return `
+    <div class="config-row account-row">
+      <div>
+        <strong>${escapeHtml(user.name)}</strong>
+        <span>${escapeHtml(user.email)} - ${user.role}</span>
+      </div>
+      <button class="ghost-button" data-delete-account-id="${user.id}" type="button" ${user.id === state.authUser?.id ? "disabled" : ""}>Remove</button>
+    </div>
+  `;
+}
+
 function metric(label, value, caption) {
   return `
     <article class="metric">
@@ -892,6 +972,13 @@ function statusPill(status) {
 }
 
 function openShiftModal(shiftId = null) {
+  if (!state.data.employees.length) {
+    state.view = "staff";
+    syncSaveStatus("Add an employee before creating shifts", true);
+    render();
+    return;
+  }
+
   state.editingShiftId = shiftId;
   const shift = shiftId
     ? state.data.shifts.find((item) => item.id === shiftId)
@@ -970,21 +1057,17 @@ function openEmployeeModal(employeeId = null) {
         name: "",
         initials: "",
         role: "Team member",
-        team: state.data.areas[0],
         phone: "",
         status: "Available",
       };
 
   document.querySelector("#employeeModalTitle").textContent = employeeId ? "Edit employee" : "New employee";
-  employeeForm.elements.team.innerHTML = state.data.areas
-    .map((area) => `<option value="${escapeHtml(area)}">${escapeHtml(area)}</option>`)
-    .join("");
 
   Object.entries(employee).forEach(([key, value]) => {
     if (employeeForm.elements[key]) employeeForm.elements[key].value = value;
   });
 
-  deleteEmployeeButton.classList.toggle("hidden", !employeeId || state.data.employees.length <= 1);
+  deleteEmployeeButton.classList.toggle("hidden", !employeeId);
   employeeModal.classList.remove("hidden");
   employeeForm.elements.name.focus();
 }
@@ -1032,6 +1115,177 @@ function syncSaveStatus(message = null, isError = false) {
   }
 
   saveStatus.textContent = state.data.savedAt ? `Saved locally ${formatTime(state.data.savedAt)}` : "Saved locally";
+}
+
+function syncAuthScreen() {
+  const signedIn = Boolean(state.authUser);
+  authScreen.classList.toggle("hidden", signedIn);
+  accountStatus.textContent = signedIn ? `${state.authUser.name} (${state.authUser.role})` : "Signed out";
+  signOutButton.classList.toggle("hidden", !signedIn);
+
+  if (signedIn) return;
+
+  authNameField.classList.toggle("hidden", !state.setupRequired);
+  authForm.elements.name.required = state.setupRequired;
+  authForm.elements.password.autocomplete = state.setupRequired ? "new-password" : "current-password";
+  authTitle.textContent = state.setupRequired ? "Create owner account" : "Sign in";
+  authIntro.textContent = state.setupRequired
+    ? "Create the first admin account for Marshal."
+    : "Use your Marshal email and password.";
+  authSubmitButton.textContent = state.setupRequired ? "Create account" : "Sign in";
+}
+
+async function initAuth() {
+  if (!canUseCloudSync()) {
+    state.setupRequired = false;
+    authError.textContent = "Sign in works after Marshal is deployed to Netlify over HTTPS.";
+    syncAuthScreen();
+    return;
+  }
+
+  try {
+    const payload = await authRequest(null, "GET");
+    state.authUser = payload.user || null;
+    state.setupRequired = Boolean(payload.setupRequired);
+    state.authUsers = payload.users || [];
+    if (!state.authUser && state.authToken) {
+      state.authToken = null;
+      localStorage.removeItem(authTokenKey);
+    }
+
+    if (state.authUser) {
+      syncAuthScreen();
+      loadCloudData();
+    } else {
+      syncAuthScreen();
+    }
+  } catch (error) {
+    state.authUser = null;
+    state.setupRequired = false;
+    authError.textContent = "Could not connect to sign in.";
+    syncAuthScreen();
+    console.error(error);
+  }
+}
+
+async function submitAuth(event) {
+  event.preventDefault();
+  authError.textContent = "";
+  authSubmitButton.disabled = true;
+
+  try {
+    const formData = new FormData(authForm);
+    const action = state.setupRequired ? "setup" : "login";
+    const payload = await authRequest(
+      {
+        action,
+        name: formData.get("name"),
+        email: formData.get("email"),
+        password: formData.get("password"),
+      },
+      "POST",
+    );
+
+    state.authToken = payload.token;
+    state.authUser = payload.user;
+    state.authUsers = payload.users || [];
+    state.setupRequired = false;
+    localStorage.setItem(authTokenKey, state.authToken);
+    authForm.reset();
+    syncAuthScreen();
+    syncSaveStatus("Signed in");
+    loadCloudData();
+  } catch (error) {
+    authError.textContent = error.message || "Sign in failed";
+  } finally {
+    authSubmitButton.disabled = false;
+  }
+}
+
+async function signOut() {
+  try {
+    if (state.authToken) {
+      await authRequest({ action: "logout" }, "POST");
+    }
+  } catch (error) {
+    console.error(error);
+  }
+
+  state.authToken = null;
+  state.authUser = null;
+  state.authUsers = [];
+  localStorage.removeItem(authTokenKey);
+  state.cloudStatus = "local";
+  syncSaveStatus("Signed out");
+  initAuth();
+}
+
+async function createAccount(event) {
+  event.preventDefault();
+  const formData = new FormData(event.currentTarget);
+
+  try {
+    const payload = await authRequest(
+      {
+        action: "create-user",
+        name: formData.get("name"),
+        email: formData.get("email"),
+        password: formData.get("password"),
+        role: formData.get("role"),
+      },
+      "POST",
+    );
+
+    state.authUsers = payload.users || [];
+    event.currentTarget.reset();
+    syncSaveStatus("Login account added");
+    render();
+  } catch (error) {
+    syncSaveStatus(error.message || "Could not add account", true);
+  }
+}
+
+async function deleteAccount(userId) {
+  if (typeof confirm === "function" && !confirm("Remove this login account?")) return;
+
+  try {
+    const payload = await authRequest({ action: "delete-user", userId }, "POST");
+    state.authUsers = payload.users || [];
+    syncSaveStatus("Login account removed");
+    render();
+  } catch (error) {
+    syncSaveStatus(error.message || "Could not remove account", true);
+  }
+}
+
+async function authRequest(body = null, method = "POST") {
+  const options = {
+    method,
+    headers: {
+      Accept: "application/json",
+    },
+  };
+
+  if (state.authToken) {
+    options.headers.Authorization = `Bearer ${state.authToken}`;
+  }
+
+  if (body) {
+    options.headers["Content-Type"] = "application/json";
+    options.body = JSON.stringify(body);
+  }
+
+  const response = await fetch(authApiPath, options);
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.error || "Request failed");
+  return payload;
+}
+
+function authHeaders(extraHeaders = {}) {
+  return {
+    ...extraHeaders,
+    ...(state.authToken ? { Authorization: `Bearer ${state.authToken}` } : {}),
+  };
 }
 
 function syncInstallButton() {
@@ -1169,13 +1423,14 @@ function isStandaloneApp() {
 
 function hydrateUserSelect() {
   if (!state.data.employees.some((employee) => employee.id === state.data.currentUserId)) {
-    state.data.currentUserId = state.data.employees[0].id;
+    state.data.currentUserId = state.data.employees[0]?.id || null;
   }
 
-  userSelect.innerHTML = state.data.employees
-    .map((employee) => `<option value="${employee.id}">${employee.name}</option>`)
-    .join("");
-  userSelect.value = state.data.currentUserId;
+  userSelect.disabled = !state.data.employees.length;
+  userSelect.innerHTML = state.data.employees.length
+    ? state.data.employees.map((employee) => `<option value="${employee.id}">${employee.name}</option>`).join("")
+    : `<option value="">Add employees first</option>`;
+  userSelect.value = state.data.currentUserId || "";
 }
 
 function loadData() {
@@ -1219,6 +1474,12 @@ function saveData(options = {}) {
 }
 
 async function loadCloudData() {
+  if (!state.authToken) {
+    state.cloudStatus = "local";
+    syncSaveStatus();
+    return;
+  }
+
   if (!canUseCloudSync()) {
     state.cloudStatus = "local";
     syncSaveStatus();
@@ -1232,10 +1493,15 @@ async function loadCloudData() {
     const response = await fetch(cloudApiPath, {
       method: "GET",
       cache: "no-store",
-      headers: {
+      headers: authHeaders({
         Accept: "application/json",
-      },
+      }),
     });
+
+    if (response.status === 401) {
+      await handleAuthExpired();
+      return;
+    }
 
     if (!response.ok) throw new Error(`Cloud load failed: ${response.status}`);
 
@@ -1268,6 +1534,12 @@ async function loadCloudData() {
 }
 
 function queueCloudSave() {
+  if (!state.authToken) {
+    state.cloudStatus = "local";
+    syncSaveStatus();
+    return;
+  }
+
   if (!canUseCloudSync()) {
     state.cloudStatus = "local";
     syncSaveStatus();
@@ -1281,16 +1553,22 @@ function queueCloudSave() {
 }
 
 async function saveCloudData() {
+  if (!state.authToken) return;
   if (!canUseCloudSync()) return;
 
   try {
     const response = await fetch(cloudApiPath, {
       method: "POST",
-      headers: {
+      headers: authHeaders({
         "Content-Type": "application/json",
-      },
+      }),
       body: JSON.stringify({ data: state.data }),
     });
+
+    if (response.status === 401) {
+      await handleAuthExpired();
+      return;
+    }
 
     if (!response.ok) throw new Error(`Cloud save failed: ${response.status}`);
 
@@ -1302,6 +1580,16 @@ async function saveCloudData() {
     syncSaveStatus();
     console.error(error);
   }
+}
+
+async function handleAuthExpired() {
+  state.authToken = null;
+  state.authUser = null;
+  state.authUsers = [];
+  localStorage.removeItem(authTokenKey);
+  state.cloudStatus = "local";
+  syncSaveStatus("Session expired", true);
+  await initAuth();
 }
 
 function canUseCloudSync() {
@@ -1362,7 +1650,7 @@ function normalizeData(data) {
     ...data,
   };
 
-  merged.employees = Array.isArray(data.employees) && data.employees.length ? data.employees : defaults.employees;
+  merged.employees = Array.isArray(data.employees) ? data.employees : defaults.employees;
   merged.channels = Array.isArray(data.channels) && data.channels.length ? data.channels : defaults.channels;
   merged.shifts = Array.isArray(data.shifts) ? data.shifts : defaults.shifts;
   merged.messages = Array.isArray(data.messages) ? data.messages : defaults.messages;
@@ -1377,7 +1665,6 @@ function normalizeData(data) {
   merged.employees = merged.employees.map((employee) => ({
     ...employee,
     initials: employee.initials || makeInitials(employee.name),
-    team: employee.team || merged.areas[0],
     status: employee.status || "Available",
   }));
 
@@ -1386,74 +1673,24 @@ function normalizeData(data) {
   }
 
   if (!merged.employees.some((employee) => employee.id === merged.currentUserId)) {
-    merged.currentUserId = merged.employees[0].id;
+    merged.currentUserId = merged.employees[0]?.id || null;
   }
 
   return merged;
 }
 
 function createSeedData() {
-  const areas = ["Front counter", "Dispatch", "Warehouse", "Customer support", "Admin"];
-  const employees = [
-    {
-      id: "emp-1",
-      name: "Mia Chen",
-      initials: "MC",
-      role: "Supervisor",
-      team: "Front counter",
-      phone: "0400 111 203",
-      status: "Available",
-    },
-    {
-      id: "emp-2",
-      name: "Eli Brooks",
-      initials: "EB",
-      role: "Team member",
-      team: "Dispatch",
-      phone: "0400 428 910",
-      status: "Available",
-    },
-    {
-      id: "emp-3",
-      name: "Ava Patel",
-      initials: "AP",
-      role: "Team member",
-      team: "Warehouse",
-      phone: "0400 332 874",
-      status: "On leave",
-    },
-    {
-      id: "emp-4",
-      name: "Noah Singh",
-      initials: "NS",
-      role: "Team member",
-      team: "Customer support",
-      phone: "0400 923 515",
-      status: "Available",
-    },
-    {
-      id: "emp-5",
-      name: "Sofia Miller",
-      initials: "SM",
-      role: "Admin",
-      team: "Admin",
-      phone: "0400 887 441",
-      status: "Available",
-    },
-  ];
-
-  const base = startOfWeek(new Date());
-  const date = (offset) => toDateKey(addDays(base, offset));
+  const areas = ["General", "Landscaping", "Maintenance", "Construction", "Admin"];
 
   return {
     businessName: "Marshal",
     businessSubtitle: "Rock N Water Landscapes",
     appInstalled: false,
     notificationsEnabled: false,
-    currentUserId: "emp-1",
+    currentUserId: null,
     activeChannel: "ops",
     areas,
-    employees,
+    employees: [],
     channels: [
       {
         id: "announcements",
@@ -1471,66 +1708,9 @@ function createSeedData() {
         description: "Roster, coverage, and approval discussion",
       },
     ],
-    shifts: [
-      seedShift("emp-1", date(0), "08:00", "16:00", "Front counter", "Confirmed", "Open store and cash count"),
-      seedShift("emp-2", date(0), "09:00", "17:00", "Dispatch", "Confirmed", ""),
-      seedShift("emp-4", date(0), "10:00", "18:00", "Customer support", "Confirmed", "Handle online enquiries"),
-      seedShift("emp-2", date(1), "07:30", "15:30", "Dispatch", "Confirmed", ""),
-      seedShift("emp-3", date(1), "12:00", "18:00", "Warehouse", "Draft", "Pending leave confirmation"),
-      seedShift("emp-5", date(2), "09:00", "15:00", "Admin", "Confirmed", "Payroll prep"),
-      seedShift("emp-1", date(3), "08:00", "16:00", "Front counter", "Confirmed", ""),
-      seedShift("emp-4", date(3), "11:00", "19:00", "Customer support", "Open", "Needs senior coverage"),
-      seedShift("emp-2", date(4), "08:00", "16:00", "Warehouse", "Confirmed", ""),
-      seedShift("emp-5", date(5), "09:00", "13:00", "Admin", "Confirmed", ""),
-      seedShift("emp-1", date(6), "10:00", "16:00", "Front counter", "Open", ""),
-    ],
-    messages: [
-      seedMessage("announcements", "emp-5", -130, "New roster draft is ready for review. Please check your availability by 3pm."),
-      seedMessage("ops", "emp-1", -95, "Morning team. Dispatch is the priority before lunch, then we reset the front counter display."),
-      seedMessage("ops", "emp-2", -68, "I can cover dispatch until 5pm and hand over the pending orders before I leave."),
-      seedMessage("managers", "emp-1", -42, "We still need one person for late customer support on Thursday."),
-    ],
-    requests: [
-      {
-        id: crypto.randomUUID(),
-        employeeId: "emp-3",
-        type: "Leave",
-        date: date(1),
-        detail: "Medical appointment in the afternoon.",
-        status: "Pending",
-      },
-      {
-        id: crypto.randomUUID(),
-        employeeId: "emp-4",
-        type: "Shift swap",
-        date: date(3),
-        detail: "Can swap the late shift for an earlier start.",
-        status: "Pending",
-      },
-    ],
-  };
-}
-
-function seedShift(employeeId, date, start, end, area, status, notes) {
-  return {
-    id: crypto.randomUUID(),
-    employeeId,
-    date,
-    start,
-    end,
-    area,
-    status,
-    notes,
-  };
-}
-
-function seedMessage(channel, employeeId, minutesAgo, body) {
-  return {
-    id: crypto.randomUUID(),
-    channel,
-    employeeId,
-    body,
-    createdAt: addMinutes(new Date(), minutesAgo).toISOString(),
+    shifts: [],
+    messages: [],
+    requests: [],
   };
 }
 
@@ -1543,7 +1723,16 @@ function getActiveChannel() {
 }
 
 function findEmployee(employeeId) {
-  return state.data.employees.find((employee) => employee.id === employeeId) || state.data.employees[0];
+  return (
+    state.data.employees.find((employee) => employee.id === employeeId) || {
+      id: null,
+      name: "Unassigned",
+      initials: "--",
+      role: "",
+      phone: "",
+      status: "Unavailable",
+    }
+  );
 }
 
 function shiftsForDate(dateKey) {
@@ -1554,9 +1743,6 @@ function shiftsForDate(dateKey) {
 
 function inferAreas(data, fallbackAreas) {
   const values = new Set(fallbackAreas);
-  data.employees.forEach((employee) => {
-    if (employee.team) values.add(employee.team);
-  });
   data.shifts.forEach((shift) => {
     if (shift.area) values.add(shift.area);
   });
@@ -1564,10 +1750,7 @@ function inferAreas(data, fallbackAreas) {
 }
 
 function areaUsage(area) {
-  return (
-    state.data.employees.filter((employee) => employee.team === area).length +
-    state.data.shifts.filter((shift) => shift.area === area).length
-  );
+  return state.data.shifts.filter((shift) => shift.area === area).length;
 }
 
 function isAreaInUse(area) {
@@ -1612,12 +1795,6 @@ function startOfWeek(date) {
 function addDays(date, days) {
   const copy = new Date(date);
   copy.setDate(copy.getDate() + days);
-  return copy;
-}
-
-function addMinutes(date, minutes) {
-  const copy = new Date(date);
-  copy.setMinutes(copy.getMinutes() + minutes);
   return copy;
 }
 

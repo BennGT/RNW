@@ -14,6 +14,33 @@
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
+    <div class="auth-screen" id="authScreen">
+      <div class="auth-card">
+        <div class="auth-logo" aria-hidden="true">
+          <img src="assets/rnw-logo.png" alt="" />
+        </div>
+        <p class="eyebrow">Marshal</p>
+        <h1 id="authTitle">Sign in</h1>
+        <p class="auth-copy" id="authIntro">Use your Marshal email and password.</p>
+        <form class="form-stack" id="authForm">
+          <label class="auth-name-field hidden" id="authNameField">
+            Name
+            <input name="name" type="text" autocomplete="name" />
+          </label>
+          <label>
+            Email
+            <input name="email" type="email" autocomplete="email" required />
+          </label>
+          <label>
+            Password
+            <input name="password" type="password" autocomplete="current-password" required minlength="8" />
+          </label>
+          <div class="auth-error" id="authError" role="alert"></div>
+          <button class="primary-button" type="submit" id="authSubmitButton">Sign in</button>
+        </form>
+      </div>
+    </div>
+
     <div class="app-shell">
       <aside class="sidebar" aria-label="Main">
         <div class="brand">
@@ -51,7 +78,7 @@
         </nav>
 
         <div class="user-switcher">
-          <label for="userSelect">Signed in as</label>
+          <label for="userSelect">Employee view</label>
           <select id="userSelect"></select>
         </div>
       </aside>
@@ -64,9 +91,11 @@
           </div>
           <div class="topbar-actions">
             <div class="save-status" id="saveStatus" role="status" aria-live="polite">Saved locally</div>
+            <div class="account-pill" id="accountStatus">Signed out</div>
+            <button class="ghost-button" id="signOutButton" type="button">Sign out</button>
             <button class="ghost-button" id="installAppButton" type="button">Install app</button>
             <button class="ghost-button" id="notificationButton" type="button">Enable notifications</button>
-            <button class="ghost-button" id="seedReset" type="button">Reset demo</button>
+            <button class="ghost-button" id="seedReset" type="button">Clear data</button>
           </div>
         </header>
 
@@ -143,10 +172,6 @@
           <label>
             Role
             <input name="role" type="text" required />
-          </label>
-          <label>
-            Team or area
-            <select name="team" required></select>
           </label>
           <label>
             Phone
