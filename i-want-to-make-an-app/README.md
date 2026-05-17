@@ -47,7 +47,7 @@ Manual folder upload can show the app, but shared PC-to-phone saving may not wor
 
 On the first hosted visit, Marshal asks you to create the owner account. After that, everyone must sign in with email and password.
 
-The owner/admin can create employee login accounts from **Setup > Login accounts**. Passwords are hashed in the Netlify Function before being stored.
+The owner/admin can create employee login accounts from **Setup > Login accounts**. Passwords are hashed in the Netlify Function before being stored. The sign-in and shared data Functions use Netlify's newer `.mjs` Function format so Netlify Blobs is available in production.
 
 ## Good next steps
 
