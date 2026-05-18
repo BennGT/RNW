@@ -14,7 +14,7 @@ export default async function handler(request) {
       return new Response("", { status: 204, headers });
     }
 
-    const store = getStore("marshal-auth");
+    const store = getMarshalStore("marshal-auth");
 
     if (request.method === "GET") {
       const users = await getUsers(store);
@@ -70,6 +70,24 @@ export default async function handler(request) {
       name: error.name,
     });
   }
+}
+
+function getMarshalStore(name) {
+  const siteID =
+    process.env.MARSHAL_NETLIFY_SITE_ID ||
+    process.env.NETLIFY_SITE_ID ||
+    process.env.SITE_ID;
+
+  const token =
+    process.env.MARSHAL_NETLIFY_TOKEN ||
+    process.env.NETLIFY_BLOBS_TOKEN ||
+    process.env.NETLIFY_AUTH_TOKEN;
+
+  if (siteID && token) {
+    return getStore(name, { siteID, token });
+  }
+
+  return getStore(name);
 }
 
 async function setupOwner(store, body) {

@@ -27,7 +27,7 @@ The current notification support is local to the device that has Marshal open an
 
 ## Netlify hosting
 
-Marshal is ready to host on Netlify. For phone-to-PC syncing, deploy it through Git or the Netlify CLI so Netlify installs the `@netlify/blobs` dependency and deploys the serverless function in `netlify/functions/data.js`.
+Marshal is ready to host on Netlify. For phone-to-PC syncing, deploy it through Git or the Netlify CLI so Netlify installs the `@netlify/blobs` dependency and deploys the serverless functions in `netlify/functions`.
 
 Best option for shared saving:
 
@@ -38,6 +38,13 @@ Best option for shared saving:
 5. Set publish directory to `.`.
 6. Netlify will give you a public `https://` address.
 7. Rename the site in Netlify settings if you want a simpler address.
+
+Required environment variables for shared saving and sign-in:
+
+- `MARSHAL_NETLIFY_SITE_ID`: your Netlify Project ID from **Project configuration > General > Project information**.
+- `MARSHAL_NETLIFY_TOKEN`: a Netlify personal access token from **User settings > Applications > Personal access tokens**.
+
+After adding or changing environment variables, trigger a fresh deploy. If the sign-in page still reports a service error, open `https://your-site-name.netlify.app/.netlify/functions/auth` and check the JSON error detail.
 
 Static upload option:
 
