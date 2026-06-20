@@ -1,33 +1,58 @@
 const storageKey = "marshal-data-v1";
 const authTokenKey = "marshal-auth-token";
+const shiftReminderKey = "marshal-shift-reminders";
 const legacyStorageKeys = ["shiftlink-demo-v1"];
 const cloudApiPath = "/.netlify/functions/data";
 const authApiPath = "/.netlify/functions/auth";
+const pushApiPath = "/.netlify/functions/push";
+const teamChannel = {
+  id: "team",
+  name: "Team",
+  description: "Company messages and daily updates",
+};
 
 const state = {
   view: "dashboard",
   weekStart: startOfWeek(new Date()),
+  scheduleEmployeeFilterId: "all",
   editingShiftId: null,
   editingEmployeeId: null,
   copiedShift: null,
+  copiedWeek: null,
+  publishingWeek: false,
   deferredInstallPrompt: null,
   cloudStatus: "local",
   cloudSaveTimer: null,
+  cloudRefreshTimer: null,
+  pushPublicKey: null,
+  inviteToken: typeof window !== "undefined" ? new URLSearchParams(window.location.search).get("invite") : null,
+  inviteDetails: null,
   localChangedDuringCloudLoad: false,
   authToken: localStorage.getItem(authTokenKey),
   authUser: null,
   authUsers: [],
+  authInvites: [],
+  inviteDraft: {
+    name: "",
+    email: "",
+    phone: "",
+    role: "employee",
+  },
   setupRequired: false,
   data: loadData(),
 };
+state.seenMessageIds = new Set((state.data.messages || []).map((message) => message.id).filter(Boolean));
 
 const views = {
-  dashboard: "Today",
+  dashboard: "Home",
   schedule: "Schedule",
   messages: "Messages",
   staff: "Staff",
-  setup: "Setup",
+  requests: "Requests",
+  mydetails: "My details",
+  setup: "Account",
 };
+const defaultView = "dashboard";
 
 const areaColors = {
   General: "#276ef1",
@@ -37,13 +62,16 @@ const areaColors = {
   Admin: "#6b7280",
 };
 
+const employeeColorPalette = ["#a33a24", "#087aa3", "#d84a2a", "#211a17", "#0f766e", "#9a6700", "#7c3aed", "#be123c"];
+
 const appView = document.querySelector("#appView");
 const viewTitle = document.querySelector("#viewTitle");
 const todayLabel = document.querySelector("#todayLabel");
 const brandFallback = document.querySelector("#brandFallback");
 const brandName = document.querySelector("#brandName");
 const brandSubtitle = document.querySelector("#brandSubtitle");
-const userSelect = document.querySelector("#userSelect");
+const menuButton = document.querySelector("#menuButton");
+const appMenu = document.querySelector("#appMenu");
 const saveStatus = document.querySelector("#saveStatus");
 const accountStatus = document.querySelector("#accountStatus");
 const signOutButton = document.querySelector("#signOutButton");
@@ -63,16 +91,20 @@ const deleteShiftButton = document.querySelector("#deleteShiftButton");
 const employeeModal = document.querySelector("#employeeModal");
 const employeeForm = document.querySelector("#employeeForm");
 const deleteEmployeeButton = document.querySelector("#deleteEmployeeButton");
+let menuTouchStartX = 0;
+let menuTouchStartY = 0;
 
 init();
 
 function init() {
+  if (state.authToken && !state.inviteToken) authScreen.classList.add("hidden");
+  state.view = readViewFromUrl();
   todayLabel.textContent = formatLongDate(new Date());
   syncShell();
   syncSaveStatus();
   syncInstallButton();
   syncNotificationButton();
-  hydrateUserSelect();
+  syncCurrentEmployeeFromAuth();
   registerServiceWorker();
   bindChrome();
   render();
@@ -83,27 +115,47 @@ function bindChrome() {
   document.querySelector("#navTabs").addEventListener("click", (event) => {
     const tab = event.target.closest("[data-view]");
     if (!tab) return;
-    state.view = tab.dataset.view;
-    render();
+    navigateToView(tab.dataset.view);
+    closeMenu();
   });
 
-  userSelect.addEventListener("change", () => {
-    state.data.currentUserId = userSelect.value || null;
-    saveData();
-    render();
+  menuButton.addEventListener("click", () => {
+    document.body.classList.toggle("menu-open");
   });
 
-  document.querySelector("#seedReset").addEventListener("click", () => {
-    if (typeof confirm === "function" && !confirm("Clear all saved Marshal data? This will remove staff, schedules, messages, requests, setup changes, and hosted shared data.")) return;
-    localStorage.removeItem(storageKey);
-    legacyStorageKeys.forEach((key) => localStorage.removeItem(key));
-    state.data = createSeedData();
-    state.weekStart = startOfWeek(new Date());
-    syncShell();
-    hydrateUserSelect();
-    saveData();
-    render();
+  document.addEventListener("click", (event) => {
+    if (!document.body.classList.contains("menu-open")) return;
+    if (appMenu.contains(event.target) || menuButton.contains(event.target)) return;
+    closeMenu();
   });
+
+  appMenu.addEventListener("click", (event) => {
+    if (event.target.closest("[data-view]")) closeMenu();
+  });
+
+  appMenu.addEventListener(
+    "touchstart",
+    (event) => {
+      const touch = event.touches[0];
+      menuTouchStartX = touch.clientX;
+      menuTouchStartY = touch.clientY;
+    },
+    { passive: true },
+  );
+
+  appMenu.addEventListener(
+    "touchmove",
+    (event) => {
+      if (!document.body.classList.contains("menu-open")) return;
+      const touch = event.touches[0];
+      const deltaX = touch.clientX - menuTouchStartX;
+      const deltaY = touch.clientY - menuTouchStartY;
+      if (deltaX < -55 && Math.abs(deltaX) > Math.abs(deltaY) * 1.4) {
+        closeMenu();
+      }
+    },
+    { passive: true },
+  );
 
   backupFileInput.addEventListener("change", importBackup);
   authForm.addEventListener("submit", submitAuth);
@@ -112,9 +164,18 @@ function bindChrome() {
   notificationButton.addEventListener("click", requestNotifications);
 
   if (typeof window !== "undefined") {
+    window.addEventListener("popstate", () => {
+      state.view = readViewFromUrl();
+      render();
+    });
+
     window.addEventListener("beforeinstallprompt", (event) => {
       event.preventDefault();
       state.deferredInstallPrompt = event;
+      if (state.data.appInstalled && !isStandaloneApp()) {
+        state.data.appInstalled = false;
+        saveData({ syncCloud: false });
+      }
       syncInstallButton();
     });
 
@@ -134,6 +195,11 @@ function bindChrome() {
 
   shiftForm.addEventListener("submit", (event) => {
     event.preventDefault();
+    if (!isScheduleAdmin()) {
+      syncSaveStatus("Only admins can edit schedules", true);
+      closeShiftModal();
+      return;
+    }
     if (!state.data.employees.length) {
       syncSaveStatus("Add an employee before creating shifts", true);
       return;
@@ -142,6 +208,7 @@ function bindChrome() {
     const formData = new FormData(shiftForm);
     const shift = Object.fromEntries(formData.entries());
     shift.id = state.editingShiftId || crypto.randomUUID();
+    shift.published = formData.get("published") === "on";
     const isNew = !state.editingShiftId;
 
     const existingIndex = state.data.shifts.findIndex((item) => item.id === shift.id);
@@ -152,17 +219,27 @@ function bindChrome() {
     }
 
     saveData();
-    notifyTeam(isNew ? "New shift saved" : "Shift updated", `${findEmployee(shift.employeeId).name}: ${formatDateShort(parseDateKey(shift.date))}, ${shift.start} to ${shift.end}`);
+    notifyTeam(
+      isNew ? "New shift saved" : "Shift updated",
+      `${findEmployee(shift.employeeId).name}: ${formatDateShort(parseDateKey(shift.date))}, ${shift.start} to ${shift.end}`,
+      false,
+      shift.published,
+      { url: "/?page=schedule" },
+    );
     closeShiftModal();
     render();
   });
 
   deleteShiftButton.addEventListener("click", () => {
     if (!state.editingShiftId) return;
+    if (!isScheduleAdmin()) {
+      syncSaveStatus("Only admins can delete shifts", true);
+      return;
+    }
     const shift = state.data.shifts.find((item) => item.id === state.editingShiftId);
     state.data.shifts = state.data.shifts.filter((shift) => shift.id !== state.editingShiftId);
     saveData();
-    if (shift) notifyTeam("Shift removed", `${findEmployee(shift.employeeId).name}: ${formatDateShort(parseDateKey(shift.date))}`);
+    if (shift) notifyTeam("Shift removed", `${findEmployee(shift.employeeId).name}: ${formatDateShort(parseDateKey(shift.date))}`, false, false, { url: "/?page=schedule" });
     closeShiftModal();
     render();
   });
@@ -174,13 +251,22 @@ function bindChrome() {
 
   employeeForm.addEventListener("submit", (event) => {
     event.preventDefault();
+    if (!isOwnerAdmin()) {
+      syncSaveStatus("Only admins can edit employees", true);
+      closeEmployeeModal();
+      return;
+    }
     const formData = new FormData(employeeForm);
     const employee = Object.fromEntries(formData.entries());
     const isNew = !state.editingEmployeeId;
     employee.name = employee.name.trim();
     employee.initials = (employee.initials || makeInitials(employee.name)).trim().toUpperCase();
     employee.role = employee.role.trim();
+    employee.email = normalizeEmail(employee.email);
     employee.phone = employee.phone.trim();
+    employee.nextOfKinName = (employee.nextOfKinName || "").trim();
+    employee.nextOfKinPhone = (employee.nextOfKinPhone || "").trim();
+    employee.color = normalizeColor(employee.color) || employeeColorPalette[state.data.employees.length % employeeColorPalette.length];
     employee.id = state.editingEmployeeId || crypto.randomUUID();
 
     const existingIndex = state.data.employees.findIndex((item) => item.id === employee.id);
@@ -192,7 +278,7 @@ function bindChrome() {
 
     state.data.currentUserId = employee.id;
     saveData();
-    notifyTeam(isNew ? "Employee added" : "Employee updated", `${employee.name} - ${employee.role}`);
+    notifyTeam(isNew ? "Employee added" : "Employee updated", `${employee.name} - ${employee.role}`, false, false, { url: "/?page=staff" });
     hydrateUserSelect();
     closeEmployeeModal();
     render();
@@ -200,15 +286,21 @@ function bindChrome() {
 
   deleteEmployeeButton.addEventListener("click", () => {
     if (!state.editingEmployeeId) return;
+    if (!isOwnerAdmin()) {
+      syncSaveStatus("Only admins can delete employees", true);
+      return;
+    }
     const employee = findEmployee(state.editingEmployeeId);
     if (typeof confirm === "function" && !confirm(`Delete ${employee.name}? Their shifts, messages, and requests will also be removed.`)) return;
     state.data.employees = state.data.employees.filter((item) => item.id !== state.editingEmployeeId);
     state.data.shifts = state.data.shifts.filter((shift) => shift.employeeId !== state.editingEmployeeId);
+    const removedRequestIds = state.data.requests.filter((request) => request.employeeId === state.editingEmployeeId).map((request) => request.id);
     state.data.requests = state.data.requests.filter((request) => request.employeeId !== state.editingEmployeeId);
+    state.data.deletedRequestIds = Array.from(new Set([...(state.data.deletedRequestIds || []), ...removedRequestIds]));
     state.data.messages = state.data.messages.filter((message) => message.employeeId !== state.editingEmployeeId);
-    state.data.currentUserId = state.data.employees[0]?.id || null;
+    state.data.currentUserId = null;
     saveData();
-    notifyTeam("Employee removed", employee.name);
+    notifyTeam("Employee removed", employee.name, false, false, { url: "/?page=staff" });
     hydrateUserSelect();
     closeEmployeeModal();
     render();
@@ -216,8 +308,14 @@ function bindChrome() {
 }
 
 function render() {
+  if (!views[state.view]) state.view = defaultView;
   document.querySelectorAll(".nav-tab").forEach((tab) => {
     tab.classList.toggle("active", tab.dataset.view === state.view);
+    tab.querySelector(".nav-badge")?.remove();
+    const badgeCount = tab.dataset.view === "requests" ? pendingRequestCount() : 0;
+    if (badgeCount) {
+      tab.insertAdjacentHTML("beforeend", `<span class="nav-badge">${badgeCount}</span>`);
+    }
   });
 
   viewTitle.textContent = views[state.view];
@@ -227,20 +325,52 @@ function render() {
     schedule: renderSchedule,
     messages: renderMessages,
     staff: renderStaff,
+    requests: renderRequests,
+    mydetails: renderMyDetails,
     setup: renderSetup,
   }[state.view];
 
-  appView.innerHTML = renderer();
+  appView.innerHTML = `${renderPageBrand()}${renderer()}`;
   bindViewEvents();
 }
 
 function bindViewEvents() {
+  appView.querySelectorAll("[data-dashboard-link]").forEach((element) => {
+    element.addEventListener("click", (event) => {
+      if (event.target.closest("button, a, input, select, textarea")) return;
+      openDashboardLink(element.dataset.dashboardLink);
+    });
+    element.addEventListener("keydown", (event) => {
+      if (!["Enter", " "].includes(event.key)) return;
+      event.preventDefault();
+      openDashboardLink(element.dataset.dashboardLink);
+    });
+  });
+
   appView.querySelectorAll("[data-action='new-shift']").forEach((button) => {
     button.addEventListener("click", () => openShiftModal());
   });
 
+  appView.querySelectorAll("[data-action='publish-week']").forEach((button) => {
+    button.addEventListener("click", () => publishCurrentWeek(button));
+  });
+
+  appView.querySelectorAll("[data-action='copy-week']").forEach((button) => {
+    button.addEventListener("click", copyCurrentWeek);
+  });
+
+  appView.querySelectorAll("[data-action='paste-week']").forEach((button) => {
+    button.addEventListener("click", () => pasteCopiedWeek(button));
+  });
+
   appView.querySelectorAll("[data-shift-id]").forEach((button) => {
-    button.addEventListener("click", () => openShiftModal(button.dataset.shiftId));
+    button.addEventListener("click", () => {
+      if (state.view === "dashboard") {
+        openDashboardLink("today-schedule");
+        return;
+      }
+      openShiftModal(button.dataset.shiftId);
+    });
   });
 
   appView.querySelectorAll("[data-copy-shift-id]").forEach((button) => {
@@ -259,6 +389,20 @@ function bindViewEvents() {
     });
   });
 
+  appView.querySelectorAll("[data-schedule-filter]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.scheduleEmployeeFilterId = button.dataset.scheduleFilter;
+      render();
+    });
+  });
+
+  appView.querySelectorAll("[data-view-employee-schedule]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.scheduleEmployeeFilterId = button.dataset.viewEmployeeSchedule;
+      navigateToView("schedule");
+    });
+  });
+
   appView.querySelectorAll("[data-channel]").forEach((button) => {
     button.addEventListener("click", () => {
       state.data.activeChannel = button.dataset.channel;
@@ -267,9 +411,24 @@ function bindViewEvents() {
     });
   });
 
+  appView.querySelectorAll("[data-delete-message-id]").forEach((button) => {
+    button.addEventListener("click", () => deleteMessage(button.dataset.deleteMessageId));
+  });
+
+  appView.querySelectorAll("[data-delete-request-id]").forEach((button) => {
+    button.addEventListener("click", () => deleteRequest(button.dataset.deleteRequestId));
+  });
+
   appView.querySelectorAll("[data-action='new-employee']").forEach((button) => {
     button.addEventListener("click", () => openEmployeeModal());
   });
+
+  const accountForm = appView.querySelector("#accountForm");
+  if (accountForm) {
+    accountForm.addEventListener("input", saveInviteDraft);
+    accountForm.addEventListener("change", saveInviteDraft);
+    accountForm.addEventListener("submit", createAccount);
+  }
 
   appView.querySelectorAll("[data-action='export-data']").forEach((button) => {
     button.addEventListener("click", exportBackup);
@@ -288,24 +447,66 @@ function bindViewEvents() {
   });
 
   appView.querySelectorAll("[data-action='test-notification']").forEach((button) => {
-    button.addEventListener("click", () => notifyTeam("Marshal notifications are on", "Schedule and message alerts can appear on this device.", true));
+    button.addEventListener("click", () => notifyTeam("Sherif notifications are on", "Schedule and message alerts can appear on this device.", true, false, { url: "/" }));
   });
+
+  const personalDetailsForm = appView.querySelector("#personalDetailsForm");
+  if (personalDetailsForm) {
+    personalDetailsForm.addEventListener("submit", savePersonalDetails);
+  }
 
   appView.querySelectorAll("[data-delete-account-id]").forEach((button) => {
     button.addEventListener("click", () => deleteAccount(button.dataset.deleteAccountId));
   });
 
+  appView.querySelectorAll("[data-invite-account-id]").forEach((button) => {
+    button.addEventListener("click", () => inviteAccount(button.dataset.inviteAccountId));
+  });
+
+  appView.querySelectorAll("[data-invite-token]").forEach((button) => {
+    button.addEventListener("click", () => copyInviteLink(button.dataset.inviteToken));
+  });
+
+  appView.querySelectorAll("[data-email-invite-id]").forEach((button) => {
+    button.addEventListener("click", () => emailInviteLink(button.dataset.emailInviteId));
+  });
+
+  appView.querySelectorAll("[data-sms-invite-id]").forEach((button) => {
+    button.addEventListener("click", () => smsInviteLink(button.dataset.smsInviteId));
+  });
+
+  appView.querySelectorAll("[data-delete-invite-id]").forEach((button) => {
+    button.addEventListener("click", () => deleteInvite(button.dataset.deleteInviteId));
+  });
+
+  appView.querySelectorAll("[data-reset-password-form]").forEach((form) => {
+    form.addEventListener("submit", resetAccountPassword);
+  });
+
+  const passwordForm = appView.querySelector("#passwordForm");
+  if (passwordForm) {
+    passwordForm.addEventListener("submit", changeOwnPassword);
+  }
+
   appView.querySelectorAll("[data-employee-id]").forEach((button) => {
     button.addEventListener("click", () => openEmployeeModal(button.dataset.employeeId));
   });
 
+  appView.querySelectorAll("[data-invite-employee-id]").forEach((button) => {
+    button.addEventListener("click", () => inviteEmployee(button.dataset.inviteEmployeeId));
+  });
+
   appView.querySelectorAll("[data-request-status]").forEach((select) => {
     select.addEventListener("change", () => {
+      if (!isOwnerAdmin()) {
+        syncSaveStatus("Only admins can update requests", true);
+        return;
+      }
       const request = state.data.requests.find((item) => item.id === select.dataset.requestStatus);
       if (!request) return;
       request.status = select.value;
       saveData();
-      notifyTeam("Request updated", `${findEmployee(request.employeeId).name}: ${request.type} ${request.status}`);
+      notifyTeam("Request updated", `${findEmployee(request.employeeId).name}: ${request.type} ${request.status}`, false, false, { url: "/?page=requests" });
       render();
     });
   });
@@ -331,33 +532,53 @@ function bindViewEvents() {
       state.data.messages = state.data.messages.filter((message) => message.channel !== channelId);
       if (state.data.activeChannel === channelId) state.data.activeChannel = state.data.channels[0].id;
       saveData();
-      notifyTeam("Channel removed", channel.name);
+      notifyTeam("Channel removed", channel.name, false, false, { url: "/?page=messages" });
       render();
     });
   });
 
   const messageForm = appView.querySelector("#messageForm");
   if (messageForm) {
-    messageForm.addEventListener("submit", (event) => {
+    messageForm.elements.media?.addEventListener("change", () => previewMessageMedia(messageForm));
+    messageForm.addEventListener("submit", async (event) => {
       event.preventDefault();
       if (!state.data.currentUserId) {
         syncSaveStatus("Add an employee before sending messages", true);
         return;
       }
 
-      const input = messageForm.querySelector("input");
+      const input = messageForm.elements.body;
       const text = input.value.trim();
-      if (!text) return;
-      state.data.messages.push({
+      const mediaFile = messageForm.elements.media?.files?.[0] || null;
+      if (!text && !mediaFile) return;
+      if (mediaFile && !mediaFile.type.startsWith("image/")) {
+        syncSaveStatus("Photos and GIFs only for now", true);
+        return;
+      }
+      if (mediaFile && mediaFile.size > 2 * 1024 * 1024) {
+        syncSaveStatus("Image must be under 2 MB", true);
+        return;
+      }
+
+      const media = mediaFile ? await readFileAsDataUrl(mediaFile) : null;
+      const message = {
         id: crypto.randomUUID(),
-        channel: state.data.activeChannel,
+        channel: teamChannel.id,
         employeeId: state.data.currentUserId,
         body: text,
+        media,
         createdAt: new Date().toISOString(),
-      });
+      };
+      state.data.messages.push(message);
+      state.seenMessageIds.add(message.id);
       input.value = "";
+      if (messageForm.elements.media) messageForm.elements.media.value = "";
+      messageForm.querySelector("#messageMediaPreview")?.replaceChildren();
       saveData();
-      notifyTeam(`New message in ${getActiveChannel().name}`, text);
+      sendPushAlert("New Sherif message", `${getCurrentUser().name}: ${text || "sent a photo"}`, {
+        excludeUserId: state.authUser?.id,
+        url: "/?page=messages",
+      });
       render();
     });
   }
@@ -376,13 +597,17 @@ function bindViewEvents() {
         id: crypto.randomUUID(),
         employeeId: state.data.currentUserId,
         type: formData.get("type"),
-        date: formData.get("date"),
+        date: formData.get("startDate"),
+        startDate: formData.get("startDate"),
+        endDate: formData.get("endDate") || formData.get("startDate"),
+        startTime: formData.get("startTime"),
+        endTime: formData.get("endTime"),
         detail: formData.get("detail"),
         status: "Pending",
       });
       requestForm.reset();
       saveData();
-      notifyTeam("Staff request submitted", `${getCurrentUser().name}: ${formData.get("type")}`);
+      notifyTeam("Staff request submitted", `${getCurrentUser().name}: ${formData.get("type")}`, false, true, { url: "/?page=requests", excludeUserId: state.authUser?.id });
       render();
     });
   }
@@ -392,7 +617,7 @@ function bindViewEvents() {
     profileForm.addEventListener("submit", (event) => {
       event.preventDefault();
       const formData = new FormData(profileForm);
-      state.data.businessName = formData.get("businessName").trim() || "Marshal";
+      state.data.businessName = formData.get("businessName").trim() || "Sherif";
       state.data.businessSubtitle = formData.get("businessSubtitle").trim() || "Rock N Water Landscapes";
       saveData();
       syncShell();
@@ -409,7 +634,7 @@ function bindViewEvents() {
       if (!area || state.data.areas.includes(area)) return;
       state.data.areas.push(area);
       saveData();
-      notifyTeam("Work area added", area);
+      notifyTeam("Work area added", area, false, false, { url: "/?page=setup" });
       render();
     });
   }
@@ -427,7 +652,7 @@ function bindViewEvents() {
         description: formData.get("description").trim() || "Team discussion",
       });
       saveData();
-      notifyTeam("Channel added", name);
+      notifyTeam("Channel added", name, false, false, { url: "/?page=messages" });
       render();
     });
   }
@@ -441,15 +666,81 @@ function bindViewEvents() {
       channel.name = formData.get("name").trim() || channel.name;
       channel.description = formData.get("description").trim() || "Team discussion";
       saveData();
-      notifyTeam("Channel updated", channel.name);
+      notifyTeam("Channel updated", channel.name, false, false, { url: "/?page=messages" });
       render();
     });
   });
 
-  const accountForm = appView.querySelector("#accountForm");
-  if (accountForm) {
-    accountForm.addEventListener("submit", createAccount);
+}
+
+function saveInviteDraft(event) {
+  const form = event.currentTarget;
+  state.inviteDraft = {
+    name: form.elements.inviteName?.value || "",
+    email: form.elements.inviteEmail?.value || "",
+    phone: form.elements.invitePhone?.value || "",
+    role: form.elements.inviteRole?.value || "employee",
+  };
+}
+
+function closeMenu() {
+  document.body.classList.remove("menu-open");
+}
+
+function readFileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.addEventListener("load", () => {
+      resolve({
+        name: file.name,
+        type: file.type,
+        size: file.size,
+        dataUrl: reader.result,
+      });
+    });
+    reader.addEventListener("error", () => reject(reader.error || new Error("File could not be read")));
+    reader.readAsDataURL(file);
+  });
+}
+
+function navigateToView(view, options = {}) {
+  const nextView = views[view] ? view : defaultView;
+  state.view = nextView;
+  writeViewToHistory(nextView, options);
+  render();
+}
+
+function readViewFromUrl() {
+  if (typeof window === "undefined") return defaultView;
+  const view = new URLSearchParams(window.location.search).get("page");
+  return views[view] ? view : defaultView;
+}
+
+function writeViewToHistory(view, options = {}) {
+  if (typeof window === "undefined" || !window.history?.pushState) return;
+  const url = new URL(window.location.href);
+  if (view === defaultView) {
+    url.searchParams.delete("page");
+  } else {
+    url.searchParams.set("page", view);
   }
+  url.searchParams.delete("invite");
+
+  const nextUrl = `${url.pathname}${url.search}${url.hash}`;
+  const currentUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+  if (nextUrl === currentUrl) return;
+
+  const method = options.replace ? "replaceState" : "pushState";
+  window.history[method]({ view }, "", nextUrl);
+}
+
+function renderPageBrand() {
+  if (state.view === "dashboard") return "";
+  return `
+    <section class="page-brand-card" aria-label="Sherif app page">
+      <img src="assets/rnw-logo.png" alt="Rock N Water Landscapes" />
+    </section>
+  `;
 }
 
 function renderDashboard() {
@@ -458,27 +749,31 @@ function renderDashboard() {
   const todayShifts = shiftsForDate(todayKey);
   const currentShift = currentUser.id ? todayShifts.find((shift) => shift.employeeId === currentUser.id) : null;
   const openShifts = state.data.shifts.filter((shift) => shift.status === "Open").length;
-  const pendingRequests = state.data.requests.filter((request) => request.status === "Pending").length;
+  const pendingRequests = pendingRequestCount();
   const weekEnd = toDateKey(addDays(state.weekStart, 7));
   const weekShifts = state.data.shifts.filter((shift) => shift.date >= toDateKey(state.weekStart) && shift.date < weekEnd).length;
 
   return `
     <div class="dashboard-grid">
       <div>
+        <section class="today-brand-card" aria-label="Sherif app home">
+          <img src="assets/rnw-logo.png" alt="Rock N Water Landscapes" />
+        </section>
+
         <div class="metric-grid">
-          ${metric("On today", todayShifts.length, "Scheduled shifts")}
-          ${metric("Open shifts", openShifts, "Need coverage")}
-          ${metric("Pending", pendingRequests, "Staff requests")}
-          ${metric("This week", weekShifts, "Published shifts")}
+          ${metric("On today", todayShifts.length, "Scheduled shifts", "today-schedule")}
+          ${metric("Open shifts", openShifts, "Need coverage", "schedule")}
+          ${metric("Pending", pendingRequests, "Staff requests", "requests", pendingRequests)}
+          ${metric("This week", weekShifts, "Published shifts", "schedule")}
         </div>
 
-        <section class="panel">
+        <section class="panel clickable-card" data-dashboard-link="today-schedule" role="button" tabindex="0" aria-label="Open today's schedule">
           <div class="panel-head">
             <div>
               <h2 class="panel-title">Today's roster</h2>
               <p class="panel-subtitle">${formatDateShort(new Date())}</p>
             </div>
-            <button class="ghost-button" data-action="new-shift" type="button">Add shift</button>
+            ${isScheduleAdmin() ? `<button class="ghost-button" data-action="new-shift" type="button">Add shift</button>` : ""}
           </div>
           <div class="panel-body shift-list">
             ${
@@ -491,7 +786,7 @@ function renderDashboard() {
       </div>
 
       <div class="shift-list">
-        <section class="highlight-card">
+        <section class="highlight-card clickable-card" data-dashboard-link="my-schedule" role="button" tabindex="0" aria-label="Open my schedule">
           <div class="highlight-row">
             <div>
               <span class="highlight-label">My shift today</span>
@@ -502,7 +797,7 @@ function renderDashboard() {
           </div>
         </section>
 
-        <section class="panel">
+        <section class="panel clickable-card" data-dashboard-link="messages" role="button" tabindex="0" aria-label="Open messages">
           <div class="panel-head">
             <div>
               <h2 class="panel-title">Latest messages</h2>
@@ -510,19 +805,19 @@ function renderDashboard() {
             </div>
           </div>
           <div class="panel-body message-list">
-            ${state.data.messages.slice(-4).reverse().map(renderCompactMessage).join("")}
+            ${visibleMessages().length ? visibleMessages().slice(-4).reverse().map(renderCompactMessage).join("") : `<div class="empty-state">No messages yet.</div>`}
           </div>
         </section>
 
-        <section class="panel">
+        <section class="panel clickable-card" data-dashboard-link="requests" role="button" tabindex="0" aria-label="Open requests">
           <div class="panel-head">
             <div>
-              <h2 class="panel-title">Requests</h2>
+              <h2 class="panel-title title-with-badge">Requests ${pendingRequests ? `<span class="notification-badge">${pendingRequests}</span>` : ""}</h2>
               <p class="panel-subtitle">Leave, availability, and swaps</p>
             </div>
           </div>
           <div class="panel-body request-list">
-            ${state.data.requests.slice(0, 4).map(renderRequestItem).join("")}
+            ${state.data.requests.length ? state.data.requests.slice(0, 4).map(renderRequestItem).join("") : `<div class="empty-state">No staff requests yet.</div>`}
           </div>
         </section>
       </div>
@@ -530,10 +825,40 @@ function renderDashboard() {
   `;
 }
 
+function openDashboardLink(link) {
+  if (link === "messages") {
+    navigateToView("messages");
+    return;
+  }
+
+  if (link === "requests") {
+    navigateToView("requests");
+    return;
+  }
+
+  if (link === "my-schedule") {
+    const currentUser = getCurrentUser();
+    state.weekStart = startOfWeek(new Date());
+    state.scheduleEmployeeFilterId = currentUser.id || "all";
+    navigateToView("schedule");
+    return;
+  }
+
+  if (link === "today-schedule" || link === "schedule") {
+    state.weekStart = startOfWeek(new Date());
+    state.scheduleEmployeeFilterId = "all";
+    navigateToView("schedule");
+  }
+}
+
 function renderSchedule() {
   const days = Array.from({ length: 7 }, (_, index) => addDays(state.weekStart, index));
   const rangeLabel = `${formatDateShort(days[0])} to ${formatDateShort(days[6])}`;
   const copiedEmployee = state.copiedShift ? findEmployee(state.copiedShift.employeeId) : null;
+  const unpublishedCount = weekShifts().filter((shift) => !shift.published).length;
+  const selectedEmployee = state.scheduleEmployeeFilterId !== "all" ? findEmployee(state.scheduleEmployeeFilterId) : null;
+  const copiedWeekCount = state.copiedWeek?.shifts?.length || 0;
+  const publishDisabled = !unpublishedCount || state.publishingWeek;
 
   return `
     <div class="schedule-layout">
@@ -543,14 +868,46 @@ function renderSchedule() {
           <button data-week="0" class="active" type="button">${rangeLabel}</button>
           <button data-week="1" type="button">Next</button>
         </div>
-        <button class="primary-button" data-action="new-shift" type="button">New shift</button>
+        ${
+          isScheduleAdmin()
+            ? `<div class="toolbar">
+                <button class="ghost-button" data-action="copy-week" type="button">Copy week</button>
+                <button class="ghost-button" data-action="paste-week" type="button" ${copiedWeekCount ? "" : "disabled"}>Paste week</button>
+                <button class="ghost-button" data-action="publish-week" type="button" ${publishDisabled ? "disabled" : ""}>${state.publishingWeek ? "Publishing..." : "Publish week"}</button>
+                <button class="primary-button" data-action="new-shift" type="button">New shift</button>
+              </div>`
+            : ""
+        }
       </div>
 
+      <div class="filter-strip" aria-label="Schedule staff filter">
+        <button class="mini-button ${state.scheduleEmployeeFilterId === "all" ? "active" : ""}" data-schedule-filter="all" type="button">All staff</button>
+        ${sortedEmployees()
+          .map(
+            (employee) =>
+              `<button class="mini-button ${state.scheduleEmployeeFilterId === employee.id ? "active" : ""}" data-schedule-filter="${employee.id}" type="button">${employee.name}</button>`,
+          )
+          .join("")}
+      </div>
+      ${!isScheduleAdmin() && selectedEmployee ? `<div class="copy-banner">Showing ${selectedEmployee.name}'s published shifts.</div>` : ""}
+
       ${
-        state.copiedShift
+        state.copiedShift && isScheduleAdmin()
           ? `<div class="copy-banner">
               Copied ${copiedEmployee.name}, ${state.copiedShift.start} to ${state.copiedShift.end}. Choose Paste on a day.
             </div>`
+          : ""
+      }
+      ${
+        state.copiedWeek && isScheduleAdmin()
+          ? `<div class="copy-banner">
+              Copied ${copiedWeekCount} shift${copiedWeekCount === 1 ? "" : "s"} from ${state.copiedWeek.rangeLabel}. Go to another week and choose Paste week.
+            </div>`
+          : ""
+      }
+      ${
+        isScheduleAdmin() && unpublishedCount
+          ? `<div class="copy-banner">${unpublishedCount} shift${unpublishedCount === 1 ? "" : "s"} not yet published to employees.</div>`
           : ""
       }
 
@@ -566,7 +923,7 @@ function renderSchedule() {
                     <strong>${formatWeekday(day)}</strong>
                     <span>${formatDateShort(day)}</span>
                   </div>
-                  ${state.copiedShift ? `<button class="mini-button" data-paste-shift-date="${key}" type="button">Paste</button>` : ""}
+                  ${state.copiedShift && isScheduleAdmin() ? `<button class="mini-button" data-paste-shift-date="${key}" type="button">Paste</button>` : ""}
                 </div>
                 <div class="day-shifts">
                   ${
@@ -585,24 +942,11 @@ function renderSchedule() {
 }
 
 function renderMessages() {
-  const channels = state.data.channels;
-  const activeChannel = state.data.activeChannel;
-  const channel = channels.find((item) => item.id === activeChannel) || channels[0];
-  const messages = state.data.messages.filter((message) => message.channel === channel.id);
+  const channel = teamChannel;
+  const messages = visibleMessages().filter((message) => message.channel === channel.id);
 
   return `
     <section class="messages-layout">
-      <div class="channel-list">
-        ${channels
-          .map(
-            (item) => `
-              <button class="channel-button ${item.id === activeChannel ? "active" : ""}" data-channel="${item.id}" type="button">
-                ${item.name}
-              </button>
-            `,
-          )
-          .join("")}
-      </div>
       <div class="thread">
         <div class="thread-head">
           <h2>${channel.name}</h2>
@@ -612,8 +956,13 @@ function renderMessages() {
           ${messages.length ? messages.map(renderMessage).join("") : `<div class="empty-state">No messages yet.</div>`}
         </div>
         <form class="message-compose" id="messageForm">
-          <input type="text" placeholder="${state.data.currentUserId ? "Write a message" : "Add an employee before messaging"}" aria-label="Message" autocomplete="off" ${state.data.currentUserId ? "" : "disabled"} />
+          <input name="body" type="text" placeholder="${state.data.currentUserId ? "Write a message" : "Add an employee before messaging"}" aria-label="Message" autocomplete="off" ${state.data.currentUserId ? "" : "disabled"} />
+          <label class="media-picker">
+            <span>Add photo/GIF</span>
+            <input name="media" type="file" accept="image/*" ${state.data.currentUserId ? "" : "disabled"} />
+          </label>
           <button class="primary-button" type="submit" ${state.data.currentUserId ? "" : "disabled"}>Send</button>
+          <div class="message-media-preview" id="messageMediaPreview" aria-live="polite"></div>
         </form>
       </div>
     </section>
@@ -623,46 +972,13 @@ function renderMessages() {
 function renderStaff() {
   return `
     <div class="staff-layout">
-      <section class="panel">
-        <div class="panel-head">
-          <div>
-            <h2 class="panel-title">Staff requests</h2>
-            <p class="panel-subtitle">Create availability notes or leave requests</p>
-          </div>
-        </div>
-        <div class="panel-body">
-          <form class="form-stack" id="requestForm">
-            <label>
-              Type
-              <select name="type">
-                <option value="Leave">Leave</option>
-                <option value="Availability">Availability</option>
-                <option value="Shift swap">Shift swap</option>
-              </select>
-            </label>
-            <label>
-              Date
-              <input name="date" type="date" required />
-            </label>
-            <label>
-              Detail
-              <textarea name="detail" rows="4" required placeholder="Add the request details"></textarea>
-            </label>
-            <button class="primary-button" type="submit">Submit request</button>
-          </form>
-          <div class="section-gap request-list">
-            ${state.data.requests.length ? state.data.requests.map((request) => renderRequestItem(request, true)).join("") : `<div class="empty-state">No staff requests yet.</div>`}
-          </div>
-        </div>
-      </section>
-
-      <section class="panel">
+      <section class="panel wide-panel">
         <div class="panel-head">
           <div>
             <h2 class="panel-title">Team directory</h2>
             <p class="panel-subtitle">${state.data.employees.length} employees</p>
           </div>
-          <button class="ghost-button" data-action="new-employee" type="button">Add employee</button>
+          ${isOwnerAdmin() ? `<button class="ghost-button" data-action="new-employee" type="button">Add employee</button>` : ""}
         </div>
         <div class="panel-body staff-list">
           ${state.data.employees.length ? state.data.employees.map(renderStaffItem).join("") : `<div class="empty-state">No employees yet. Add your first employee to start building the roster.</div>`}
@@ -672,9 +988,87 @@ function renderStaff() {
   `;
 }
 
+function renderRequests() {
+  const requests = visibleRequests();
+
+  return `
+    <div class="requests-layout">
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2 class="panel-title">New request</h2>
+            <p class="panel-subtitle">Leave, availability, and shift swap details</p>
+          </div>
+        </div>
+        <div class="panel-body">
+          ${renderRequestForm()}
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2 class="panel-title title-with-badge">Requests ${pendingRequestCount() ? `<span class="notification-badge">${pendingRequestCount()}</span>` : ""}</h2>
+            <p class="panel-subtitle">${isScheduleAdmin() ? "All staff requests" : "Your requests"}</p>
+          </div>
+        </div>
+        <div class="panel-body request-list">
+          ${requests.length ? requests.map((request) => renderRequestItem(request, isOwnerAdmin())).join("") : `<div class="empty-state">No requests yet.</div>`}
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function renderRequestForm() {
+  return `
+    <form class="form-stack" id="requestForm">
+      <label>
+        Type
+        <select name="type">
+          <option value="Leave">Leave</option>
+          <option value="Availability">Availability</option>
+          <option value="Shift swap">Shift swap</option>
+        </select>
+      </label>
+      <label>
+        Start date
+        <input name="startDate" type="date" required />
+      </label>
+      <label>
+        End date
+        <input name="endDate" type="date" required />
+      </label>
+      <label>
+        Start time
+        <input name="startTime" type="time" />
+      </label>
+      <label>
+        End time
+        <input name="endTime" type="time" />
+      </label>
+      <label>
+        Detail
+        <textarea name="detail" rows="4" required placeholder="Add the request details"></textarea>
+      </label>
+      <button class="primary-button" type="submit">Submit request</button>
+    </form>
+  `;
+}
+
 function renderSetup() {
+  if (!isOwnerAdmin()) {
+    return `
+      <div class="setup-layout">
+        ${renderPasswordPanel()}
+        ${renderPhoneAlertsPanel()}
+      </div>
+    `;
+  }
+
   return `
     <div class="setup-layout">
+      ${renderPasswordPanel()}
       <section class="panel">
         <div class="panel-head">
           <div>
@@ -718,25 +1112,6 @@ function renderSetup() {
       <section class="panel wide-panel">
         <div class="panel-head">
           <div>
-            <h2 class="panel-title">Message channels</h2>
-            <p class="panel-subtitle">Edit channel names or add a new team thread</p>
-          </div>
-        </div>
-        <div class="panel-body">
-          <form class="inline-form" id="channelForm">
-            <input name="name" type="text" placeholder="Channel name" aria-label="Channel name" />
-            <input name="description" type="text" placeholder="Channel description" aria-label="Channel description" />
-            <button class="primary-button" type="submit">Add</button>
-          </form>
-          <div class="config-list">
-            ${state.data.channels.map(renderChannelRow).join("")}
-          </div>
-        </div>
-      </section>
-
-      <section class="panel wide-panel">
-        <div class="panel-head">
-          <div>
             <h2 class="panel-title">Data backup</h2>
             <p class="panel-subtitle">Changes autosave in this browser; export a backup when you want a copy</p>
           </div>
@@ -747,40 +1122,32 @@ function renderSetup() {
         </div>
       </section>
 
-      <section class="panel wide-panel">
-        <div class="panel-head">
-          <div>
-            <h2 class="panel-title">Phone app and alerts</h2>
-            <p class="panel-subtitle">Install Marshal on a phone and enable browser notifications</p>
-          </div>
-        </div>
-        <div class="panel-body backup-actions">
-          <button class="primary-button" data-action="install-app" type="button">Install app</button>
-          <button class="ghost-button" data-action="enable-notifications" type="button">Enable notifications</button>
-          <button class="ghost-button" data-action="test-notification" type="button">Send test</button>
-        </div>
-      </section>
+      ${renderPhoneAlertsPanel()}
 
       ${
-        state.authUser?.role === "admin"
+        isOwnerAdmin()
           ? `<section class="panel wide-panel">
               <div class="panel-head">
                 <div>
                   <h2 class="panel-title">Login accounts</h2>
-                  <p class="panel-subtitle">Create email and password access for employees</p>
+                  <p class="panel-subtitle">Create invite links and send by email or SMS</p>
                 </div>
               </div>
               <div class="panel-body">
-                <form class="inline-form account-form" id="accountForm">
-                  <input name="name" type="text" placeholder="Name" aria-label="Name" required />
-                  <input name="email" type="email" placeholder="Email" aria-label="Email" required />
-                  <input name="password" type="password" placeholder="Password" aria-label="Password" minlength="8" required />
-                  <select name="role" aria-label="Role">
-                    <option value="employee">Employee</option>
-                    <option value="admin">Admin</option>
+                <form class="inline-form account-form" id="accountForm" autocomplete="off">
+                  <input name="inviteName" type="text" placeholder="Name" aria-label="Name" autocomplete="off" value="${escapeHtml(state.inviteDraft.name)}" required />
+                  <input name="inviteEmail" type="email" placeholder="Email" aria-label="Email" autocomplete="off" inputmode="email" value="${escapeHtml(state.inviteDraft.email)}" />
+                  <input name="invitePhone" type="tel" placeholder="Phone" aria-label="Phone" autocomplete="off" inputmode="tel" value="${escapeHtml(state.inviteDraft.phone)}" />
+                  <select name="inviteRole" aria-label="Role" autocomplete="off">
+                    <option value="employee" ${state.inviteDraft.role === "employee" ? "selected" : ""}>Employee</option>
+                    <option value="manager" ${state.inviteDraft.role === "manager" ? "selected" : ""}>Manager</option>
+                    <option value="admin" ${state.inviteDraft.role === "admin" ? "selected" : ""}>Admin</option>
                   </select>
-                  <button class="primary-button" type="submit">Add account</button>
+                  <button class="primary-button" type="submit">Create invite</button>
                 </form>
+                <div class="section-gap config-list">
+                  ${state.authInvites.length ? state.authInvites.filter((invite) => !invite.acceptedAt).map(renderInviteRow).join("") : `<div class="empty-state">No pending invitations.</div>`}
+                </div>
                 <div class="config-list">
                   ${state.authUsers.length ? state.authUsers.map(renderAccountRow).join("") : `<div class="empty-state">No login accounts loaded.</div>`}
                 </div>
@@ -792,13 +1159,118 @@ function renderSetup() {
   `;
 }
 
+function renderMyDetails() {
+  return `
+    <div class="setup-layout">
+      ${renderPersonalDetailsPanel()}
+    </div>
+  `;
+}
+
+function renderPersonalDetailsPanel() {
+  const employee = getOwnEmployeeProfile();
+  const showBlankProfile = !employee.id || employee.profileComplete !== true;
+  const profile = !showBlankProfile
+    ? employee
+    : {
+        id: null,
+        name: "",
+        initials: "",
+        email: normalizeEmail(state.authUser?.email),
+        phone: "",
+        nextOfKinName: "",
+        nextOfKinPhone: "",
+      };
+
+  return `
+    <section class="panel wide-panel">
+      <div class="panel-head">
+        <div>
+          <h2 class="panel-title">My details</h2>
+          <p class="panel-subtitle">Keep your personal and emergency details up to date</p>
+        </div>
+      </div>
+      <div class="panel-body">
+        <form class="form-grid" id="personalDetailsForm">
+          <label>
+            Name
+            <input name="name" type="text" value="${escapeHtml(profile.name)}" required />
+          </label>
+          <label>
+            Initials
+            <input name="initials" type="text" maxlength="3" value="${escapeHtml(profile.initials)}" required />
+          </label>
+          <label>
+            Email
+            <input name="email" type="email" value="${escapeHtml(profile.email)}" readonly required />
+          </label>
+          <label>
+            Phone
+            <input name="phone" type="tel" value="${escapeHtml(profile.phone)}" />
+          </label>
+          <label>
+            Next of kin
+            <input name="nextOfKinName" type="text" value="${escapeHtml(profile.nextOfKinName)}" />
+          </label>
+          <label>
+            Next of kin phone
+            <input name="nextOfKinPhone" type="tel" value="${escapeHtml(profile.nextOfKinPhone)}" />
+          </label>
+          <div class="modal-actions full-field">
+            <button class="primary-button" type="submit">Save my details</button>
+          </div>
+        </form>
+      </div>
+    </section>
+  `;
+}
+
+function renderPasswordPanel() {
+  return `
+    <section class="panel wide-panel">
+      <div class="panel-head">
+        <div>
+          <h2 class="panel-title">Password</h2>
+          <p class="panel-subtitle">Change your Sherif sign-in password</p>
+        </div>
+      </div>
+      <div class="panel-body">
+        <form class="inline-form password-form" id="passwordForm">
+          <input name="currentPassword" type="password" placeholder="Current password" aria-label="Current password" required />
+          <input name="newPassword" type="password" placeholder="New password" aria-label="New password" minlength="8" required />
+          <button class="primary-button" type="submit">Change password</button>
+        </form>
+      </div>
+    </section>
+  `;
+}
+
+function renderPhoneAlertsPanel() {
+  return `
+    <section class="panel wide-panel">
+      <div class="panel-head">
+        <div>
+          <h2 class="panel-title">Phone app and alerts</h2>
+          <p class="panel-subtitle">Install Sherif on a phone and enable browser notifications</p>
+        </div>
+      </div>
+      <div class="panel-body backup-actions">
+        <button class="primary-button" data-action="install-app" type="button">Install app</button>
+        <button class="ghost-button" data-action="enable-notifications" type="button">Enable notifications</button>
+        <button class="ghost-button" data-action="test-notification" type="button">Send test</button>
+      </div>
+    </section>
+  `;
+}
+
 function renderShiftItem(shift) {
   const employee = findEmployee(shift.employeeId);
+  const employeeColor = employee.color || colorForEmployee(employee.id);
   return `
-    <button class="shift-item" data-shift-id="${shift.id}" type="button">
+    <button class="shift-item" data-shift-id="${shift.id}" type="button" style="border-left-color: ${employeeColor}">
       <div class="shift-main">
         <div class="person-line">
-          <span class="avatar">${employee.initials}</span>
+          <span class="avatar" style="background: ${softColor(employeeColor)}; color: ${employeeColor}">${employee.initials}</span>
           <div>
             <strong>${employee.name}</strong>
             <span>${shift.area}</span>
@@ -817,18 +1289,26 @@ function renderShiftItem(shift) {
 function renderScheduleShift(shift) {
   const employee = findEmployee(shift.employeeId);
   const className = shift.status.toLowerCase();
+  const employeeColor = employee.color || colorForEmployee(employee.id);
   return `
-    <article class="schedule-shift ${className}" style="border-left-color: ${areaColors[shift.area] || "#276ef1"}">
+    <article class="schedule-shift ${className}" style="--employee-color: ${employeeColor}; --employee-soft: ${softColor(employeeColor)}; border-left-color: ${employeeColor}">
       <div class="schedule-shift-head">
         <strong>${shift.start} to ${shift.end}</strong>
-        ${statusPill(shift.status)}
+        ${shift.published ? statusPill(shift.status) : statusPill("Unpublished")}
       </div>
-      <span>${employee.name}</span>
+      <div class="schedule-person">
+        <span class="avatar small-avatar" style="background: ${softColor(employeeColor)}; color: ${employeeColor}">${employee.initials}</span>
+        <strong>${employee.name}</strong>
+      </div>
       <span>${shift.area}</span>
-      <div class="shift-card-actions">
-        <button class="ghost-button" data-shift-id="${shift.id}" type="button">Edit</button>
-        <button class="ghost-button" data-copy-shift-id="${shift.id}" type="button">Copy</button>
-      </div>
+      ${
+        isScheduleAdmin()
+          ? `<div class="shift-card-actions">
+              <button class="ghost-button" data-shift-id="${shift.id}" type="button">Edit</button>
+              <button class="ghost-button" data-copy-shift-id="${shift.id}" type="button">Copy</button>
+            </div>`
+          : ""
+      }
     </article>
   `;
 }
@@ -841,32 +1321,53 @@ function renderCompactMessage(message) {
         <span>${employee.name}</span>
         <span>${formatTime(message.createdAt)}</span>
       </div>
-      <p>${escapeHtml(message.body)}</p>
+      <p>${escapeHtml(message.body || (message.media ? "Sent a photo" : ""))}</p>
     </article>
   `;
 }
 
 function renderMessage(message) {
   const employee = findEmployee(message.employeeId);
+  const canDelete = isOwnerAdmin() || message.employeeId === state.data.currentUserId;
   return `
     <article class="message-item ${message.employeeId === state.data.currentUserId ? "own" : ""}">
       <div class="message-head">
         <span>${employee.name}</span>
         <span>${formatMessageDate(message.createdAt)}</span>
       </div>
-      <p>${escapeHtml(message.body)}</p>
+      ${message.body ? `<p>${escapeHtml(message.body)}</p>` : ""}
+      ${renderMessageMedia(message.media)}
+      ${
+        canDelete
+          ? `<div class="message-actions">
+              <button class="mini-button" data-delete-message-id="${message.id}" type="button">Delete</button>
+            </div>`
+          : ""
+      }
     </article>
+  `;
+}
+
+function renderMessageMedia(media) {
+  if (!media?.dataUrl) return "";
+  return `
+    <figure class="message-media">
+      <img src="${escapeHtml(media.dataUrl)}" alt="${escapeHtml(media.name || "Message attachment")}" loading="lazy" />
+      ${media.name ? `<figcaption>${escapeHtml(media.name)}</figcaption>` : ""}
+    </figure>
   `;
 }
 
 function renderRequestItem(request, editable = false) {
   const employee = findEmployee(request.employeeId);
+  const timing = getRequestTiming(request);
+  const canDelete = isOwnerAdmin();
   return `
     <article class="request-item">
       <div class="request-main">
         <div>
           <strong>${request.type}</strong>
-          <div class="request-meta">${employee.name} - ${formatDateShort(parseDateKey(request.date))}</div>
+          <div class="request-meta">${employee.name} - ${timing.rangeLabel}</div>
         </div>
         ${
           editable
@@ -876,21 +1377,118 @@ function renderRequestItem(request, editable = false) {
             : statusPill(request.status)
         }
       </div>
+      <div class="request-detail-grid">
+        <span><strong>Start</strong>${timing.startLabel}</span>
+        <span><strong>End</strong>${timing.endLabel}</span>
+        <span><strong>Duration</strong>${timing.durationLabel}</span>
+        <span><strong>Status</strong>${request.status}</span>
+      </div>
       ${request.detail ? `<div class="request-meta">${escapeHtml(request.detail)}</div>` : ""}
+      ${
+        canDelete
+          ? `<div class="request-actions">
+              <button class="mini-button" data-delete-request-id="${request.id}" type="button">Delete request</button>
+            </div>`
+          : ""
+      }
     </article>
   `;
 }
 
+function getRequestTiming(request) {
+  const startDate = request.startDate || request.date || request.endDate;
+  const endDate = request.endDate || request.date || startDate;
+  const startTime = request.startTime || "";
+  const endTime = request.endTime || "";
+  const hasTimes = Boolean(startTime || endTime);
+
+  if (!startDate) {
+    return {
+      rangeLabel: "No dates saved",
+      startLabel: "Not set",
+      endLabel: "Not set",
+      durationLabel: "Not available",
+    };
+  }
+
+  const startLabel = `${formatDateFull(parseDateKey(startDate))}${startTime ? `, ${formatClock(startTime)}` : ""}`;
+  const endLabel = `${formatDateFull(parseDateKey(endDate))}${endTime ? `, ${formatClock(endTime)}` : ""}`;
+  const rangeLabel = endDate && endDate !== startDate
+    ? `${formatDateShort(parseDateKey(startDate))} to ${formatDateShort(parseDateKey(endDate))}`
+    : formatDateShort(parseDateKey(startDate));
+
+  return {
+    rangeLabel,
+    startLabel,
+    endLabel,
+    durationLabel: hasTimes ? formatTimedRequestDuration(startDate, endDate, startTime, endTime) : formatAllDayRequestDuration(startDate, endDate),
+  };
+}
+
+function formatAllDayRequestDuration(startDate, endDate) {
+  const start = parseDateKey(startDate);
+  const end = parseDateKey(endDate || startDate);
+  const totalDays = Math.floor((end - start) / (24 * 60 * 60 * 1000)) + 1;
+  if (totalDays < 1) return "Check dates";
+  const label = formatMonthsDays(totalDays);
+  return totalDays >= 30 ? `${label} (${totalDays} days total)` : label;
+}
+
+function formatTimedRequestDuration(startDate, endDate, startTime, endTime) {
+  const start = parseDateTime(startDate, startTime || "00:00");
+  const end = parseDateTime(endDate || startDate, endTime || "23:59");
+  const totalMinutes = Math.max(0, Math.round((end - start) / (60 * 1000)));
+  if (!totalMinutes) return "Check times";
+
+  const totalDays = Math.floor(totalMinutes / (24 * 60));
+  const months = Math.floor(totalDays / 30);
+  const days = totalDays % 30;
+  const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
+  const minutes = totalMinutes % 60;
+  const parts = [];
+  if (months) parts.push(`${months} month${months === 1 ? "" : "s"}`);
+  if (days) parts.push(`${days} day${days === 1 ? "" : "s"}`);
+  if (hours) parts.push(`${hours} hour${hours === 1 ? "" : "s"}`);
+  if (minutes) parts.push(`${minutes} min${minutes === 1 ? "" : "s"}`);
+  return parts.join(", ");
+}
+
+function formatMonthsDays(totalDays) {
+  const months = Math.floor(totalDays / 30);
+  const days = totalDays % 30;
+  const parts = [];
+  if (months) parts.push(`${months} month${months === 1 ? "" : "s"}`);
+  if (days) parts.push(`${days} day${days === 1 ? "" : "s"}`);
+  return parts.join(", ") || "0 days";
+}
+
+function parseDateTime(dateKey, timeValue) {
+  const [hours, minutes] = String(timeValue || "00:00").split(":").map(Number);
+  const date = parseDateKey(dateKey);
+  date.setHours(Number.isFinite(hours) ? hours : 0, Number.isFinite(minutes) ? minutes : 0, 0, 0);
+  return date;
+}
+
+function formatClock(timeValue) {
+  return new Intl.DateTimeFormat("en-AU", {
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(parseDateTime("2000-01-01", timeValue));
+}
+
 function renderStaffItem(employee) {
   const nextShift = state.data.shifts
-    .filter((shift) => shift.employeeId === employee.id && shift.date >= toDateKey(new Date()))
+    .filter((shift) => shift.employeeId === employee.id && shift.date >= toDateKey(new Date()) && canSeeShift(shift))
     .sort((a, b) => `${a.date} ${a.start}`.localeCompare(`${b.date} ${b.start}`))[0];
+  const employeeColor = employee.color || colorForEmployee(employee.id);
+  const ownEmployee = getOwnEmployeeProfile();
+  const canSeePrivateDetails = isOwnerAdmin() || employee.id === ownEmployee.id;
 
   return `
-    <article class="staff-item">
+    <article class="staff-item" style="border-left-color: ${employeeColor}">
       <div class="staff-main">
         <div class="person-line">
-          <span class="avatar">${employee.initials}</span>
+          <span class="avatar" style="background: ${softColor(employeeColor)}; color: ${employeeColor}">${employee.initials}</span>
           <div>
             <strong>${employee.name}</strong>
             <span>${employee.role}</span>
@@ -898,14 +1496,20 @@ function renderStaffItem(employee) {
         </div>
         ${statusPill(employee.status)}
       </div>
-      <div class="staff-meta">
+      ${canSeePrivateDetails ? `<div class="staff-meta">
+        <span>${employee.email || "No email saved"}</span>
         <span>${employee.phone || "No phone saved"}</span>
-      </div>
+      </div>` : ""}
+      ${canSeePrivateDetails ? `<div class="staff-meta">
+        <span>Next of kin: ${employee.nextOfKinName || "Not saved"}${employee.nextOfKinPhone ? `, ${employee.nextOfKinPhone}` : ""}</span>
+      </div>` : ""}
       <div class="staff-meta">
         <span>${nextShift ? `${formatDateShort(parseDateKey(nextShift.date))}, ${nextShift.start}` : "No upcoming shift"}</span>
       </div>
       <div class="staff-actions">
-        <button class="ghost-button" data-employee-id="${employee.id}" type="button">Edit</button>
+        ${isOwnerAdmin() ? `<button class="ghost-button" data-invite-employee-id="${employee.id}" type="button" ${employee.email ? "" : "disabled"}>Invite</button>` : ""}
+        <button class="ghost-button" data-view-employee-schedule="${employee.id}" type="button">View shifts</button>
+        ${isOwnerAdmin() ? `<button class="ghost-button" data-employee-id="${employee.id}" type="button">Edit</button>` : ""}
       </div>
     </article>
   `;
@@ -923,6 +1527,125 @@ function renderAreaRow(area) {
       <button class="ghost-button" data-remove-area="${escapeHtml(area)}" type="button" ${locked ? "disabled" : ""}>Remove</button>
     </div>
   `;
+}
+
+function savePersonalDetails(event) {
+  event.preventDefault();
+  const employee = getOwnEmployeeProfile();
+  const accountEmail = normalizeEmail(state.authUser?.email);
+  if (!accountEmail) {
+    syncSaveStatus("Sign in again before saving details", true);
+    return;
+  }
+
+  const formData = new FormData(event.currentTarget);
+  let existingIndex = state.data.employees.findIndex((item) => item.id === employee.id);
+  let employeeId = employee.id;
+
+  if (existingIndex < 0) {
+    employeeId = crypto.randomUUID();
+    state.data.employees.push({
+      id: employeeId,
+      name: "",
+      initials: "",
+      role: "Team member",
+      email: accountEmail,
+      phone: "",
+      nextOfKinName: "",
+      nextOfKinPhone: "",
+      color: colorForEmployee(employeeId),
+      status: "Available",
+    });
+    existingIndex = state.data.employees.length - 1;
+    state.data.currentUserId = employeeId;
+  }
+
+  state.data.employees[existingIndex] = {
+    ...state.data.employees[existingIndex],
+    name: String(formData.get("name") || "").trim(),
+    initials: String(formData.get("initials") || "").trim().toUpperCase(),
+    email: accountEmail,
+    phone: String(formData.get("phone") || "").trim(),
+    nextOfKinName: String(formData.get("nextOfKinName") || "").trim(),
+    nextOfKinPhone: String(formData.get("nextOfKinPhone") || "").trim(),
+    profileComplete: true,
+  };
+
+  saveData();
+  syncCurrentEmployeeFromAuth();
+  syncSaveStatus("Personal details saved");
+  navigateToView("dashboard");
+}
+
+function deleteMessage(messageId) {
+  const message = state.data.messages.find((item) => item.id === messageId);
+  if (!message) return;
+
+  if (isOwnerAdmin()) {
+    if (typeof confirm === "function" && !confirm("Delete this message for everyone?")) return;
+    state.data.messages = state.data.messages.filter((item) => item.id !== messageId);
+    state.data.deletedMessageIds = Array.from(new Set([...(state.data.deletedMessageIds || []), messageId]));
+    saveData();
+    syncSaveStatus("Message deleted");
+    render();
+    return;
+  }
+
+  if (message.employeeId !== state.data.currentUserId) {
+    syncSaveStatus("You can only remove your own messages", true);
+    return;
+  }
+
+  if (typeof confirm === "function" && !confirm("Hide this message from your view? Admins will still be able to see it.")) return;
+  message.hiddenForUserIds = Array.from(new Set([...(message.hiddenForUserIds || []), state.authUser?.id].filter(Boolean)));
+  saveData();
+  syncSaveStatus("Message hidden from your view");
+  render();
+}
+
+function deleteRequest(requestId) {
+  const request = state.data.requests.find((item) => item.id === requestId);
+  if (!request) return;
+  if (!isOwnerAdmin()) {
+    syncSaveStatus("Only admins can delete requests", true);
+    return;
+  }
+
+  if (typeof confirm === "function" && !confirm("Delete this request?")) return;
+  state.data.requests = state.data.requests.filter((item) => item.id !== requestId);
+  state.data.deletedRequestIds = Array.from(new Set([...(state.data.deletedRequestIds || []), requestId]));
+  saveData();
+  syncSaveStatus("Request deleted");
+  render();
+}
+
+async function previewMessageMedia(form) {
+  const preview = form.querySelector("#messageMediaPreview");
+  if (!preview) return;
+  preview.replaceChildren();
+
+  const file = form.elements.media?.files?.[0];
+  if (!file) return;
+  if (!file.type.startsWith("image/")) {
+    preview.innerHTML = `<div class="empty-state">Photos and GIFs only for now.</div>`;
+    return;
+  }
+  if (file.size > 2 * 1024 * 1024) {
+    preview.innerHTML = `<div class="empty-state">Image must be under 2 MB.</div>`;
+    return;
+  }
+
+  try {
+    const media = await readFileAsDataUrl(file);
+    preview.innerHTML = `
+      <article class="message-item own preview-message">
+        ${form.elements.body.value.trim() ? `<p>${escapeHtml(form.elements.body.value.trim())}</p>` : ""}
+        ${renderMessageMedia(media)}
+      </article>
+    `;
+  } catch (error) {
+    preview.innerHTML = `<div class="empty-state">Preview could not be loaded.</div>`;
+  }
 }
 
 function renderChannelRow(channel) {
@@ -945,25 +1668,72 @@ function renderChannelRow(channel) {
 }
 
 function renderAccountRow(user) {
+  const roleLabel = user.role === "admin" ? "Owner admin" : user.role === "manager" ? "Manager" : "Employee";
   return `
     <div class="config-row account-row">
       <div>
         <strong>${escapeHtml(user.name)}</strong>
-        <span>${escapeHtml(user.email)} - ${user.role}</span>
+        <span>${escapeHtml(user.email)} - ${roleLabel}</span>
       </div>
-      <button class="ghost-button" data-delete-account-id="${user.id}" type="button" ${user.id === state.authUser?.id ? "disabled" : ""}>Remove</button>
+      <form class="row-actions reset-password-form" data-reset-password-form="${user.id}">
+        <input name="newPassword" type="password" placeholder="New password" aria-label="New password for ${escapeHtml(user.name)}" minlength="8" required />
+        <button class="ghost-button" type="submit">Reset</button>
+      </form>
+      <div class="row-actions">
+        <button class="ghost-button" data-invite-account-id="${user.id}" type="button">Invite</button>
+        <button class="ghost-button" data-delete-account-id="${user.id}" type="button" ${user.id === state.authUser?.id ? "disabled" : ""}>Remove</button>
+      </div>
     </div>
   `;
 }
 
-function metric(label, value, caption) {
+function renderInviteRow(invite) {
+  const inviteLink = buildInviteLink(invite.token);
+  const inviteStatus = invite.acceptedAt ? `Accepted ${formatMessageDate(invite.acceptedAt)}` : "Pending";
+  const inviteContact = `${escapeHtml(invite.email)}${invite.phone ? ` - ${escapeHtml(invite.phone)}` : ""}`;
+  const roleLabel = invite.role === "admin" ? "Owner admin" : invite.role === "manager" ? "Manager" : "Employee";
   return `
-    <article class="metric">
+    <div class="config-row account-row">
+      <div>
+        <strong>${escapeHtml(invite.name)}</strong>
+        <span>${inviteContact} - ${roleLabel} - ${inviteStatus}</span>
+      </div>
+      <input type="text" value="${escapeHtml(inviteLink)}" aria-label="Invite link for ${escapeHtml(invite.name)}" readonly />
+      <div class="row-actions">
+        <button class="ghost-button" data-invite-token="${invite.token}" type="button">Copy link</button>
+        <button class="ghost-button" data-email-invite-id="${invite.id}" type="button">Email</button>
+        <button class="ghost-button" data-sms-invite-id="${invite.id}" type="button" ${invite.phone ? "" : "disabled"}>SMS</button>
+        <button class="ghost-button" data-delete-invite-id="${invite.id}" type="button">Delete</button>
+      </div>
+    </div>
+  `;
+}
+
+function metric(label, value, caption, link = "", badge = 0) {
+  return `
+    <article class="metric ${link ? "clickable-card" : ""}" ${link ? `data-dashboard-link="${link}" role="button" tabindex="0"` : ""}>
       <span>${label}</span>
-      <strong>${value}</strong>
+      <strong>${value}${badge ? `<span class="notification-badge metric-badge">${badge}</span>` : ""}</strong>
       <small>${caption}</small>
     </article>
   `;
+}
+
+function pendingRequestCount() {
+  const requests = visibleRequests();
+  return requests.filter((request) => request.status === "Pending").length;
+}
+
+function visibleRequests() {
+  return isScheduleAdmin()
+    ? state.data.requests
+    : state.data.requests.filter((request) => request.employeeId === state.data.currentUserId);
+}
+
+function visibleMessages() {
+  if (isOwnerAdmin()) return state.data.messages;
+  const userId = state.authUser?.id;
+  return state.data.messages.filter((message) => !userId || !Array.isArray(message.hiddenForUserIds) || !message.hiddenForUserIds.includes(userId));
 }
 
 function statusPill(status) {
@@ -972,10 +1742,14 @@ function statusPill(status) {
 }
 
 function openShiftModal(shiftId = null) {
+  if (!isScheduleAdmin()) {
+    syncSaveStatus("Only admins can edit schedules", true);
+    return;
+  }
+
   if (!state.data.employees.length) {
-    state.view = "staff";
     syncSaveStatus("Add an employee before creating shifts", true);
-    render();
+    navigateToView("staff");
     return;
   }
 
@@ -989,19 +1763,29 @@ function openShiftModal(shiftId = null) {
         end: "17:00",
         area: state.data.areas[0],
         status: "Confirmed",
+        published: false,
         notes: "",
       };
 
   document.querySelector("#shiftModalTitle").textContent = shiftId ? "Edit shift" : "New shift";
-  shiftForm.elements.employeeId.innerHTML = state.data.employees
+  shiftForm.elements.employeeId.innerHTML = sortedEmployees()
     .map((employee) => `<option value="${employee.id}">${employee.name}</option>`)
     .join("");
   shiftForm.elements.area.innerHTML = state.data.areas
     .map((area) => `<option value="${escapeHtml(area)}">${escapeHtml(area)}</option>`)
     .join("");
 
+  if (!shiftId && !shift.employeeId) {
+    shift.employeeId = state.data.employees[0]?.id || "";
+  }
+
   Object.entries(shift).forEach(([key, value]) => {
-    if (shiftForm.elements[key]) shiftForm.elements[key].value = value;
+    if (!shiftForm.elements[key]) return;
+    if (shiftForm.elements[key].type === "checkbox") {
+      shiftForm.elements[key].checked = Boolean(value);
+      return;
+    }
+    shiftForm.elements[key].value = value;
   });
 
   deleteShiftButton.classList.toggle("hidden", !shiftId);
@@ -1016,6 +1800,11 @@ function closeShiftModal() {
 }
 
 function copyShift(shiftId) {
+  if (!isScheduleAdmin()) {
+    syncSaveStatus("Only admins can copy shifts", true);
+    return;
+  }
+
   const shift = state.data.shifts.find((item) => item.id === shiftId);
   if (!shift) return;
 
@@ -1025,6 +1814,7 @@ function copyShift(shiftId) {
     end: shift.end,
     area: shift.area,
     status: shift.status,
+    published: false,
     notes: shift.notes || "",
   };
 
@@ -1034,6 +1824,11 @@ function copyShift(shiftId) {
 }
 
 function pasteShift(date) {
+  if (!isScheduleAdmin()) {
+    syncSaveStatus("Only admins can paste shifts", true);
+    return;
+  }
+
   if (!state.copiedShift) return;
 
   const pastedShift = {
@@ -1044,12 +1839,121 @@ function pasteShift(date) {
 
   state.data.shifts.push(pastedShift);
   saveData();
-  notifyTeam("Shift pasted", `${findEmployee(pastedShift.employeeId).name}: ${formatDateShort(parseDateKey(date))}, ${pastedShift.start} to ${pastedShift.end}`);
+  notifyTeam("Shift pasted", `${findEmployee(pastedShift.employeeId).name}: ${formatDateShort(parseDateKey(date))}, ${pastedShift.start} to ${pastedShift.end}`, false, false, { url: "/?page=schedule" });
   syncSaveStatus("Shift pasted");
   render();
 }
 
+function copyCurrentWeek() {
+  if (!isScheduleAdmin()) {
+    syncSaveStatus("Only admins can copy schedules", true);
+    return;
+  }
+
+  const shifts = weekShifts();
+  if (!shifts.length) {
+    syncSaveStatus("No shifts to copy this week", true);
+    return;
+  }
+
+  state.copiedShift = null;
+  state.copiedWeek = {
+    start: toDateKey(state.weekStart),
+    rangeLabel: `${formatDateShort(state.weekStart)} to ${formatDateShort(addDays(state.weekStart, 6))}`,
+    shifts: shifts.map((shift) => ({
+      employeeId: shift.employeeId,
+      dayOffset: daysBetween(state.weekStart, parseDateKey(shift.date)),
+      start: shift.start,
+      end: shift.end,
+      area: shift.area,
+      status: shift.status,
+      published: false,
+      notes: shift.notes || "",
+    })),
+  };
+
+  syncSaveStatus(`Copied week (${state.copiedWeek.shifts.length} shifts)`);
+  render();
+}
+
+function pasteCopiedWeek(button = null) {
+  if (!isScheduleAdmin()) {
+    syncSaveStatus("Only admins can paste schedules", true);
+    return;
+  }
+
+  if (!state.copiedWeek?.shifts?.length) {
+    syncSaveStatus("Copy a week first", true);
+    return;
+  }
+
+  const existingShifts = weekShifts();
+  if (
+    existingShifts.length &&
+    typeof confirm === "function" &&
+    !confirm(`This week already has ${existingShifts.length} shift${existingShifts.length === 1 ? "" : "s"}. Paste copied shifts as well?`)
+  ) {
+    return;
+  }
+
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Pasting...";
+  }
+
+  const pastedShifts = state.copiedWeek.shifts.map((shift) => ({
+    ...shift,
+    id: crypto.randomUUID(),
+    date: toDateKey(addDays(state.weekStart, shift.dayOffset)),
+    published: false,
+  }));
+
+  state.data.shifts.push(...pastedShifts);
+  saveData();
+  notifyTeam("Schedule week pasted", `${formatDateShort(state.weekStart)} to ${formatDateShort(addDays(state.weekStart, 6))}`, false, false, { url: "/?page=schedule" });
+  syncSaveStatus(`Pasted week (${pastedShifts.length} shifts)`);
+  render();
+}
+
+function publishCurrentWeek(button = null) {
+  if (!isScheduleAdmin()) {
+    syncSaveStatus("Only admins can publish schedules", true);
+    return;
+  }
+
+  if (state.publishingWeek) return;
+
+  const shifts = weekShifts().filter((shift) => !shift.published);
+  if (!shifts.length) {
+    syncSaveStatus("No unpublished shifts this week");
+    return;
+  }
+
+  state.publishingWeek = true;
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Publishing...";
+  }
+  syncSaveStatus("Publishing week");
+
+  shifts.forEach((shift) => {
+    shift.published = true;
+    if (shift.status === "Draft") shift.status = "Confirmed";
+  });
+
+  saveData();
+  notifyTeam("Schedule published", `${formatDateShort(state.weekStart)} to ${formatDateShort(addDays(state.weekStart, 6))}`, false, true, { url: "/?page=schedule" });
+  state.publishingWeek = false;
+  syncSaveStatus("Week published to employees");
+  render();
+}
+
 function openEmployeeModal(employeeId = null) {
+  if (!isOwnerAdmin()) {
+    syncSaveStatus("Only admins can edit employees", true);
+    return;
+  }
+
   state.editingEmployeeId = employeeId;
   const employee = employeeId
     ? findEmployee(employeeId)
@@ -1057,7 +1961,11 @@ function openEmployeeModal(employeeId = null) {
         name: "",
         initials: "",
         role: "Team member",
+        email: "",
         phone: "",
+        nextOfKinName: "",
+        nextOfKinPhone: "",
+        color: employeeColorPalette[state.data.employees.length % employeeColorPalette.length],
         status: "Available",
       };
 
@@ -1070,6 +1978,40 @@ function openEmployeeModal(employeeId = null) {
   deleteEmployeeButton.classList.toggle("hidden", !employeeId);
   employeeModal.classList.remove("hidden");
   employeeForm.elements.name.focus();
+}
+
+async function inviteEmployee(employeeId) {
+  if (!isOwnerAdmin()) {
+    syncSaveStatus("Only owner admins can invite staff from here", true);
+    return;
+  }
+  const employee = findEmployee(employeeId);
+  if (!employee.email) {
+    syncSaveStatus("Add an email before inviting this employee", true);
+    return;
+  }
+
+  try {
+    const payload = await authRequest(
+      {
+        action: "create-invite",
+        name: employee.name,
+        email: employee.email,
+        role: "employee",
+      },
+      "POST",
+    );
+    state.authInvites = payload.invites || state.authInvites;
+    const inviteLink = buildInviteLink(payload.invite.token);
+    await sendInvite({
+      email: employee.email,
+      name: employee.name,
+      body: buildStaffInviteBody(employee.name, employee.email, inviteLink),
+    });
+    render();
+  } catch (error) {
+    syncSaveStatus(error.message || "Could not create invite", true);
+  }
 }
 
 function closeEmployeeModal() {
@@ -1125,29 +2067,43 @@ function syncAuthScreen() {
 
   if (signedIn) return;
 
-  authNameField.classList.toggle("hidden", !state.setupRequired);
-  authForm.elements.name.required = state.setupRequired;
-  authForm.elements.password.autocomplete = state.setupRequired ? "new-password" : "current-password";
-  authTitle.textContent = state.setupRequired ? "Create owner account" : "Sign in";
-  authIntro.textContent = state.setupRequired
-    ? "Create the first admin account for Marshal."
-    : "Use your Marshal email and password.";
-  authSubmitButton.textContent = state.setupRequired ? "Create account" : "Sign in";
+  const acceptingInvite = Boolean(state.inviteToken);
+  authNameField.classList.toggle("hidden", !state.setupRequired && !acceptingInvite);
+  authForm.elements.name.required = state.setupRequired || acceptingInvite;
+  authForm.elements.email.readOnly = acceptingInvite && Boolean(state.inviteDetails?.email);
+  authForm.elements.email.value = acceptingInvite && state.inviteDetails?.email ? state.inviteDetails.email : authForm.elements.email.value;
+  authForm.elements.name.value = acceptingInvite && state.inviteDetails?.name ? state.inviteDetails.name : authForm.elements.name.value;
+  authForm.elements.password.autocomplete = state.setupRequired || acceptingInvite ? "new-password" : "current-password";
+  authTitle.textContent = acceptingInvite ? "Create your account" : state.setupRequired ? "Create owner account" : "Sign in";
+  authIntro.textContent = acceptingInvite
+    ? "Choose your Sherif password to accept the invite."
+    : state.setupRequired
+      ? "Create the first admin account for Sherif."
+      : "Use your Sherif email and password.";
+  authSubmitButton.textContent = acceptingInvite || state.setupRequired ? "Create account" : "Sign in";
 }
 
 async function initAuth() {
   if (!canUseCloudSync()) {
     state.setupRequired = false;
-    authError.textContent = "Sign in works after Marshal is deployed to Netlify over HTTPS.";
+    authError.textContent = "Sign in works after Sherif is deployed to Netlify over HTTPS.";
     syncAuthScreen();
     return;
   }
 
   try {
+    if (state.inviteToken) {
+      clearLocalAuthSession();
+      await loadInviteDetails();
+      syncAuthScreen();
+      return;
+    }
+
     const payload = await authRequest(null, "GET");
     state.authUser = payload.user || null;
     state.setupRequired = Boolean(payload.setupRequired);
     state.authUsers = payload.users || [];
+    state.authInvites = payload.invites || [];
     if (!state.authUser && state.authToken) {
       state.authToken = null;
       localStorage.removeItem(authTokenKey);
@@ -1156,6 +2112,7 @@ async function initAuth() {
     if (state.authUser) {
       syncAuthScreen();
       loadCloudData();
+      startCloudRefresh();
     } else {
       syncAuthScreen();
     }
@@ -1168,6 +2125,29 @@ async function initAuth() {
   }
 }
 
+function clearLocalAuthSession() {
+  state.authToken = null;
+  state.authUser = null;
+  state.authUsers = [];
+  state.authInvites = [];
+  state.cloudStatus = "local";
+  stopCloudRefresh();
+  localStorage.removeItem(authTokenKey);
+}
+
+async function loadInviteDetails() {
+  if (!state.inviteToken) return;
+
+  const response = await fetch(`${authApiPath}?invite=${encodeURIComponent(state.inviteToken)}`, {
+    method: "GET",
+    cache: "no-store",
+    headers: { Accept: "application/json" },
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.error || "Invite link could not be loaded");
+  state.inviteDetails = payload.invite || null;
+}
+
 async function submitAuth(event) {
   event.preventDefault();
   authError.textContent = "";
@@ -1175,10 +2155,12 @@ async function submitAuth(event) {
 
   try {
     const formData = new FormData(authForm);
-    const action = state.setupRequired ? "setup" : "login";
+    const action = state.inviteToken ? "accept-invite" : state.setupRequired ? "setup" : "login";
+    const acceptedInvite = Boolean(state.inviteToken);
     const payload = await authRequest(
       {
         action,
+        token: state.inviteToken,
         name: formData.get("name"),
         email: formData.get("email"),
         password: formData.get("password"),
@@ -1189,12 +2171,22 @@ async function submitAuth(event) {
     state.authToken = payload.token;
     state.authUser = payload.user;
     state.authUsers = payload.users || [];
+    state.authInvites = payload.invites || [];
     state.setupRequired = false;
+    if (acceptedInvite) {
+      navigateToView("mydetails", { replace: true });
+    }
+    if (acceptedInvite && typeof window !== "undefined") {
+      state.inviteToken = null;
+      state.inviteDetails = null;
+      writeViewToHistory(state.view, { replace: true });
+    }
     localStorage.setItem(authTokenKey, state.authToken);
     authForm.reset();
     syncAuthScreen();
     syncSaveStatus("Signed in");
     loadCloudData();
+    startCloudRefresh();
   } catch (error) {
     authError.textContent = error.message || "Sign in failed";
   } finally {
@@ -1214,6 +2206,8 @@ async function signOut() {
   state.authToken = null;
   state.authUser = null;
   state.authUsers = [];
+  state.authInvites = [];
+  stopCloudRefresh();
   localStorage.removeItem(authTokenKey);
   state.cloudStatus = "local";
   syncSaveStatus("Signed out");
@@ -1223,25 +2217,41 @@ async function signOut() {
 async function createAccount(event) {
   event.preventDefault();
   const formData = new FormData(event.currentTarget);
+  const inviteEmail = String(formData.get("inviteEmail") || "").trim();
+  const invitePhone = String(formData.get("invitePhone") || "").trim();
+
+  if (!inviteEmail && !invitePhone) {
+    syncSaveStatus("Add an email or phone number for the invite", true);
+    return;
+  }
 
   try {
     const payload = await authRequest(
       {
-        action: "create-user",
-        name: formData.get("name"),
-        email: formData.get("email"),
-        password: formData.get("password"),
-        role: formData.get("role"),
+        action: "create-invite",
+        name: formData.get("inviteName"),
+        email: inviteEmail,
+        phone: invitePhone,
+        role: formData.get("inviteRole"),
       },
       "POST",
     );
 
-    state.authUsers = payload.users || [];
+    state.authInvites = payload.invites || [];
+    state.inviteDraft = {
+      name: "",
+      email: "",
+      phone: "",
+      role: "employee",
+    };
     event.currentTarget.reset();
-    syncSaveStatus("Login account added");
+    if (payload.invite?.token) {
+      await copyText(buildInviteLink(payload.invite.token));
+    }
+    syncSaveStatus("Invite link created and copied");
     render();
   } catch (error) {
-    syncSaveStatus(error.message || "Could not add account", true);
+    syncSaveStatus(error.message || "Could not create invite", true);
   }
 }
 
@@ -1256,6 +2266,171 @@ async function deleteAccount(userId) {
   } catch (error) {
     syncSaveStatus(error.message || "Could not remove account", true);
   }
+}
+
+async function deleteInvite(inviteId) {
+  const invite = state.authInvites.find((item) => item.id === inviteId);
+  const label = invite ? `${invite.name} (${invite.email})` : "this invite";
+  if (typeof confirm === "function" && !confirm(`Delete invite for ${label}? The link will stop working.`)) return;
+
+  try {
+    const payload = await authRequest({ action: "delete-invite", inviteId }, "POST");
+    state.authInvites = payload.invites || [];
+    syncSaveStatus("Invite deleted");
+    render();
+  } catch (error) {
+    syncSaveStatus(error.message || "Could not delete invite", true);
+  }
+}
+
+async function changeOwnPassword(event) {
+  event.preventDefault();
+  const formData = new FormData(event.currentTarget);
+
+  try {
+    await authRequest(
+      {
+        action: "change-password",
+        currentPassword: formData.get("currentPassword"),
+        newPassword: formData.get("newPassword"),
+      },
+      "POST",
+    );
+
+    event.currentTarget.reset();
+    syncSaveStatus("Password changed");
+  } catch (error) {
+    syncSaveStatus(error.message || "Could not change password", true);
+  }
+}
+
+async function resetAccountPassword(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const formData = new FormData(form);
+
+  try {
+    const payload = await authRequest(
+      {
+        action: "reset-password",
+        userId: form.dataset.resetPasswordForm,
+        newPassword: formData.get("newPassword"),
+      },
+      "POST",
+    );
+
+    state.authUsers = payload.users || [];
+    form.reset();
+    syncSaveStatus("Password reset");
+    render();
+  } catch (error) {
+    syncSaveStatus(error.message || "Could not reset password", true);
+  }
+}
+
+async function inviteAccount(userId) {
+  const user = state.authUsers.find((item) => item.id === userId);
+  if (!user) return;
+
+  await sendInvite({
+    email: user.email,
+    name: user.name,
+    body: buildLoginInviteBody(user.name, user.email),
+  });
+}
+
+async function copyInviteLink(token) {
+  const copied = await copyText(buildInviteLink(token));
+  syncSaveStatus(copied ? "Invite link copied" : "Could not copy invite link", !copied);
+}
+
+async function emailInviteLink(inviteId) {
+  const invite = state.authInvites.find((item) => item.id === inviteId);
+  if (!invite) return;
+
+  await sendInvite({
+    email: invite.email,
+    name: invite.name,
+    body: buildStaffInviteBody(invite.name, invite.email, buildInviteLink(invite.token)),
+  });
+}
+
+async function smsInviteLink(inviteId) {
+  const invite = state.authInvites.find((item) => item.id === inviteId);
+  if (!invite?.phone) {
+    syncSaveStatus("Add a phone number before sending SMS", true);
+    return;
+  }
+
+  const message = buildStaffInviteBody(invite.name, invite.email, buildInviteLink(invite.token));
+  await copyText(message);
+  const separator = /iPad|iPhone|iPod/i.test(navigator.userAgent) ? "&" : "?";
+  window.location.href = `sms:${encodeURIComponent(invite.phone)}${separator}body=${encodeURIComponent(message)}`;
+  syncSaveStatus(`SMS invite ready for ${invite.name}`);
+}
+
+function buildInviteLink(token) {
+  return `${window.location.origin}${window.location.pathname}?invite=${encodeURIComponent(token)}`;
+}
+
+function buildStaffInviteBody(name, email, inviteLink) {
+  return `Hi ${name},
+
+You have been invited to use Sherif for Rock N Water Landscapes schedules and messages.
+
+Open Sherif here:
+${inviteLink}
+
+Use this email address to sign in:
+${email}
+
+Choose your password when the invite link opens.
+
+Thanks`;
+}
+
+function buildLoginInviteBody(name, email) {
+  return `Hi ${name},
+
+You have been invited to use Sherif for Rock N Water Landscapes schedules and messages.
+
+Open Sherif here:
+${window.location.origin}
+
+Sign in with this email address:
+${email}
+
+Your manager will give you your temporary password separately. After you sign in, go to Account > Password to change it.
+
+Thanks`;
+}
+
+async function sendInvite({ email, name, body }) {
+  const copied = await copyText(body);
+  const subject = encodeURIComponent("Your Sherif app invite");
+  const encodedBody = encodeURIComponent(body);
+  const mailtoUrl = `mailto:${encodeURIComponent(email)}?subject=${subject}&body=${encodedBody}`;
+  const link = document.createElement("a");
+  link.href = mailtoUrl;
+  link.rel = "noopener";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+
+  syncSaveStatus(copied ? `Invite copied and email opened for ${name}` : `Email opened for ${name}`);
+}
+
+async function copyText(text) {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (error) {
+    console.error(error);
+  }
+
+  return false;
 }
 
 async function authRequest(body = null, method = "POST") {
@@ -1300,8 +2475,9 @@ function authHeaders(extraHeaders = {}) {
 }
 
 function syncInstallButton() {
-  const installed = isStandaloneApp() || state.data.appInstalled;
-  installAppButton.textContent = installed ? "Installed" : "Install app";
+  const installed = isStandaloneApp() || (state.data.appInstalled && !state.deferredInstallPrompt);
+  installAppButton.classList.toggle("hidden", installed);
+  installAppButton.textContent = "Install app";
   installAppButton.disabled = installed;
 }
 
@@ -1391,34 +2567,141 @@ async function requestNotifications() {
   syncNotificationButton();
 
   if (permission === "granted") {
-    notifyTeam("Marshal notifications enabled", "This device can receive Marshal alerts.", true);
+    await registerPushSubscription();
+    sendUpcomingShiftReminder();
+    notifyTeam("Sherif notifications enabled", "This device can receive Sherif alerts.", true, false, { url: "/" });
   } else {
     syncSaveStatus("Notifications not enabled");
   }
 }
 
-function notifyTeam(title, body, force = false) {
+function notifyTeam(title, body, force = false, sendPush = false, routeOptions = {}) {
+  if (sendPush) sendPushAlert(title, body, routeOptions);
+
   if (!force && !state.data.notificationsEnabled) return;
   if (!supportsNotifications() || window.Notification.permission !== "granted") {
     syncNotificationButton();
     return;
   }
 
-  const options = {
+  const notificationOptions = {
     body,
     icon: "assets/marshal-icon-192.png",
     badge: "assets/marshal-icon-192.png",
     tag: `marshal-${title.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`,
+    data: {
+      url: routeOptions.url || "/",
+    },
   };
 
   if (typeof navigator !== "undefined" && "serviceWorker" in navigator) {
     navigator.serviceWorker.ready
-      .then((registration) => registration.showNotification(title, options))
-      .catch(() => new window.Notification(title, options));
+      .then((registration) => registration.showNotification(title, notificationOptions))
+      .catch(() => new window.Notification(title, notificationOptions));
     return;
   }
 
-  new window.Notification(title, options);
+  new window.Notification(title, notificationOptions);
+}
+
+function sendUpcomingShiftReminder() {
+  if (!state.data.notificationsEnabled || !state.data.currentUserId) return;
+
+  const now = new Date();
+  const reminderWindow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+  const nextShift = state.data.shifts
+    .filter((shift) => shift.employeeId === state.data.currentUserId && shift.published)
+    .map((shift) => ({ ...shift, startsAt: new Date(`${shift.date}T${shift.start || "00:00"}`) }))
+    .filter((shift) => shift.startsAt > now && shift.startsAt <= reminderWindow)
+    .sort((a, b) => a.startsAt - b.startsAt)[0];
+
+  if (!nextShift) return;
+
+  const reminderId = `${nextShift.id}:${nextShift.date}:${nextShift.start}`;
+  const reminders = loadReminderIds();
+  if (reminders.includes(reminderId)) return;
+
+  reminders.push(reminderId);
+  localStorage.setItem(shiftReminderKey, JSON.stringify(reminders.slice(-100)));
+  notifyTeam("Upcoming shift", `${nextShift.area}, ${formatDateShort(parseDateKey(nextShift.date))}, ${nextShift.start} to ${nextShift.end}`, true, false, { url: "/?page=schedule" });
+}
+
+function loadReminderIds() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(shiftReminderKey) || "[]");
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+async function registerPushSubscription() {
+  if (!state.authToken || typeof navigator === "undefined" || !("serviceWorker" in navigator) || !("PushManager" in window)) return;
+
+  try {
+    const response = await fetch(pushApiPath, {
+      method: "GET",
+      cache: "no-store",
+      headers: authHeaders({ Accept: "application/json" }),
+    });
+    if (!response.ok) return;
+
+    const payload = await response.json();
+    state.pushPublicKey = payload.publicKey || null;
+    if (!payload.enabled || !state.pushPublicKey) {
+      syncSaveStatus("Local notifications on. Phone push needs VAPID keys in Netlify.");
+      return;
+    }
+
+    const registration = await navigator.serviceWorker.ready;
+    const existing = await registration.pushManager.getSubscription();
+    const subscription =
+      existing ||
+      (await registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(state.pushPublicKey),
+      }));
+
+    await fetch(pushApiPath, {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({
+        action: "subscribe",
+        employeeId: state.data.currentUserId,
+        subscription,
+      }),
+    });
+  } catch (error) {
+    console.error(error);
+    syncSaveStatus("Local notifications on. Phone push setup needs checking.", true);
+  }
+}
+
+async function sendPushAlert(title, body, options = {}) {
+  if (!state.authToken || !canUseCloudSync()) return;
+
+  try {
+    await fetch(pushApiPath, {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({
+        action: "notify",
+        title,
+        body,
+        url: options.url || "/",
+        excludeUserId: options.excludeUserId || null,
+      }),
+    });
+  } catch (error) {
+    console.error(error);
+  }
+}
+
+function urlBase64ToUint8Array(base64String) {
+  const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = `${base64String}${padding}`.replace(/-/g, "+").replace(/_/g, "/");
+  const rawData = window.atob(base64);
+  return Uint8Array.from([...rawData].map((character) => character.charCodeAt(0)));
 }
 
 function supportsNotifications() {
@@ -1432,16 +2715,30 @@ function isStandaloneApp() {
   );
 }
 
-function hydrateUserSelect() {
-  if (!state.data.employees.some((employee) => employee.id === state.data.currentUserId)) {
-    state.data.currentUserId = state.data.employees[0]?.id || null;
-  }
+function isAdmin() {
+  return isScheduleAdmin();
+}
 
-  userSelect.disabled = !state.data.employees.length;
-  userSelect.innerHTML = state.data.employees.length
-    ? state.data.employees.map((employee) => `<option value="${employee.id}">${employee.name}</option>`).join("")
-    : `<option value="">Add employees first</option>`;
-  userSelect.value = state.data.currentUserId || "";
+function isScheduleAdmin() {
+  return state.authUser?.role === "admin" || state.authUser?.role === "manager";
+}
+
+function isOwnerAdmin() {
+  return state.authUser?.role === "admin";
+}
+
+function syncCurrentEmployeeFromAuth() {
+  if (!state.authUser?.email) return;
+  const employee = state.data.employees.find((item) => normalizeEmail(item.email) === normalizeEmail(state.authUser.email));
+  state.data.currentUserId = employee?.id || null;
+}
+
+function hydrateUserSelect() {
+  syncCurrentEmployeeFromAuth();
+
+  if (!state.data.employees.some((employee) => employee.id === state.data.currentUserId)) {
+    state.data.currentUserId = null;
+  }
 }
 
 function loadData() {
@@ -1484,7 +2781,7 @@ function saveData(options = {}) {
   }
 }
 
-async function loadCloudData() {
+async function loadCloudData(options = {}) {
   if (!state.authToken) {
     state.cloudStatus = "local";
     syncSaveStatus();
@@ -1497,8 +2794,10 @@ async function loadCloudData() {
     return;
   }
 
-  state.cloudStatus = "loading";
-  syncSaveStatus();
+  if (!options.silent) {
+    state.cloudStatus = "loading";
+    syncSaveStatus();
+  }
 
   try {
     const response = await fetch(cloudApiPath, {
@@ -1523,16 +2822,18 @@ async function loadCloudData() {
         return;
       }
 
-      state.data = normalizeData(payload.data);
+      const nextData = normalizeData(payload.data);
+      notifyForReceivedMessages(nextData);
+      state.data = nextData;
       saveData({ syncCloud: false });
       syncShell();
       syncInstallButton();
       syncNotificationButton();
       hydrateUserSelect();
-      render();
+      if (!isTypingInAppView()) render();
       state.cloudStatus = "synced";
       state.localChangedDuringCloudLoad = false;
-      syncSaveStatus("Loaded shared data");
+      syncSaveStatus(options.silent ? null : "Loaded shared data");
       return;
     }
 
@@ -1542,6 +2843,39 @@ async function loadCloudData() {
     syncSaveStatus();
     console.error(error);
   }
+}
+
+function notifyForReceivedMessages(nextData) {
+  const ownEmployeeId = getOwnEmployeeProfile().id || state.data.currentUserId;
+  const incomingMessages = Array.isArray(nextData.messages) ? nextData.messages : [];
+  const newMessages = incomingMessages.filter((message) => message.id && !state.seenMessageIds.has(message.id));
+  incomingMessages.forEach((message) => {
+    if (message.id) state.seenMessageIds.add(message.id);
+  });
+
+  const received = newMessages.filter((message) => message.employeeId !== ownEmployeeId);
+  if (!received.length) return;
+
+  const latest = received[received.length - 1];
+  const sender = nextData.employees.find((employee) => employee.id === latest.employeeId) || findEmployee(latest.employeeId);
+  notifyTeam(`New message from ${sender.name}`, latest.body || "Sent a photo", true, false, { url: "/?page=messages" });
+}
+
+function startCloudRefresh() {
+  stopCloudRefresh();
+  if (!state.authToken || !canUseCloudSync()) return;
+
+  state.cloudRefreshTimer = setInterval(() => {
+    if (state.cloudStatus === "syncing" || state.cloudStatus === "loading") return;
+    loadCloudData({ silent: true });
+    refreshAuthLists();
+    sendUpcomingShiftReminder();
+  }, 15000);
+}
+
+function stopCloudRefresh() {
+  if (state.cloudRefreshTimer) clearInterval(state.cloudRefreshTimer);
+  state.cloudRefreshTimer = null;
 }
 
 function queueCloudSave() {
@@ -1597,10 +2931,29 @@ async function handleAuthExpired() {
   state.authToken = null;
   state.authUser = null;
   state.authUsers = [];
+  state.authInvites = [];
   localStorage.removeItem(authTokenKey);
   state.cloudStatus = "local";
   syncSaveStatus("Session expired", true);
   await initAuth();
+}
+
+async function refreshAuthLists() {
+  if (!isOwnerAdmin()) return;
+
+  try {
+    const payload = await authRequest(null, "GET");
+    state.authUsers = payload.users || state.authUsers;
+    state.authInvites = payload.invites || state.authInvites;
+    if (state.view === "setup" && !isTypingInAppView()) render();
+  } catch (error) {
+    console.error(error);
+  }
+}
+
+function isTypingInAppView() {
+  const active = document.activeElement;
+  return Boolean(active && appView.contains(active) && ["INPUT", "SELECT", "TEXTAREA"].includes(active.tagName));
 }
 
 function canUseCloudSync() {
@@ -1615,7 +2968,7 @@ function exportBackup() {
   const backup = {
     version: 1,
     exportedAt: new Date().toISOString(),
-    app: "Marshal",
+    app: "Sherif",
     data: state.data,
   };
   const blob = new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" });
@@ -1662,12 +3015,16 @@ function normalizeData(data) {
   };
 
   merged.employees = Array.isArray(data.employees) ? data.employees : defaults.employees;
-  merged.channels = Array.isArray(data.channels) && data.channels.length ? data.channels : defaults.channels;
+  merged.channels = [teamChannel];
   merged.shifts = Array.isArray(data.shifts) ? data.shifts : defaults.shifts;
-  merged.messages = Array.isArray(data.messages) ? data.messages : defaults.messages;
-  merged.requests = Array.isArray(data.requests) ? data.requests : defaults.requests;
+  merged.deletedMessageIds = Array.isArray(data.deletedMessageIds) ? data.deletedMessageIds : [];
+  merged.deletedRequestIds = Array.isArray(data.deletedRequestIds) ? data.deletedRequestIds : [];
+  merged.messages = (Array.isArray(data.messages) ? data.messages : defaults.messages)
+    .filter((message) => !merged.deletedMessageIds.includes(message.id))
+    .map((message) => ({ ...message, channel: teamChannel.id, media: message.media || null, hiddenForUserIds: Array.isArray(message.hiddenForUserIds) ? message.hiddenForUserIds : [] }));
+  merged.requests = (Array.isArray(data.requests) ? data.requests : defaults.requests).filter((request) => !merged.deletedRequestIds.includes(request.id));
   merged.areas = Array.isArray(data.areas) && data.areas.length ? data.areas : inferAreas(merged, defaults.areas);
-  merged.businessName = !data.businessName || data.businessName === "ShiftLink" ? defaults.businessName : data.businessName;
+  merged.businessName = !data.businessName || data.businessName === "ShiftLink" || data.businessName === "Marshal" ? defaults.businessName : data.businessName;
   merged.businessSubtitle =
     !data.businessSubtitle || data.businessSubtitle === "Business workforce" ? defaults.businessSubtitle : data.businessSubtitle;
   merged.appInstalled = Boolean(data.appInstalled);
@@ -1677,14 +3034,23 @@ function normalizeData(data) {
     ...employee,
     initials: employee.initials || makeInitials(employee.name),
     status: employee.status || "Available",
+    email: normalizeEmail(employee.email),
+    phone: employee.phone || "",
+    nextOfKinName: employee.nextOfKinName || "",
+    nextOfKinPhone: employee.nextOfKinPhone || "",
+    color: normalizeColor(employee.color) || colorForEmployee(employee.id),
+    profileComplete: Boolean(employee.profileComplete),
   }));
 
-  if (!merged.channels.some((channel) => channel.id === merged.activeChannel)) {
-    merged.activeChannel = merged.channels[0].id;
-  }
+  merged.shifts = merged.shifts.map((shift) => ({
+    ...shift,
+    published: typeof shift.published === "boolean" ? shift.published : shift.status === "Confirmed",
+  }));
+
+  merged.activeChannel = teamChannel.id;
 
   if (!merged.employees.some((employee) => employee.id === merged.currentUserId)) {
-    merged.currentUserId = merged.employees[0]?.id || null;
+    merged.currentUserId = null;
   }
 
   return merged;
@@ -1694,33 +3060,19 @@ function createSeedData() {
   const areas = ["General", "Landscaping", "Maintenance", "Construction", "Admin"];
 
   return {
-    businessName: "Marshal",
+    businessName: "Sherif",
     businessSubtitle: "Rock N Water Landscapes",
     appInstalled: false,
     notificationsEnabled: false,
     currentUserId: null,
-    activeChannel: "ops",
+    activeChannel: teamChannel.id,
     areas,
     employees: [],
-    channels: [
-      {
-        id: "announcements",
-        name: "Announcements",
-        description: "Company-wide updates and policy notes",
-      },
-      {
-        id: "ops",
-        name: "Operations",
-        description: "Daily handover and shift coordination",
-      },
-      {
-        id: "managers",
-        name: "Managers",
-        description: "Roster, coverage, and approval discussion",
-      },
-    ],
+    channels: [teamChannel],
     shifts: [],
     messages: [],
+    deletedMessageIds: [],
+    deletedRequestIds: [],
     requests: [],
   };
 }
@@ -1729,8 +3081,14 @@ function getCurrentUser() {
   return findEmployee(state.data.currentUserId);
 }
 
+function getOwnEmployeeProfile() {
+  const email = normalizeEmail(state.authUser?.email);
+  if (!email) return findEmployee(null);
+  return findEmployee(state.data.employees.find((employee) => normalizeEmail(employee.email) === email)?.id);
+}
+
 function getActiveChannel() {
-  return state.data.channels.find((channel) => channel.id === state.data.activeChannel) || state.data.channels[0];
+  return teamChannel;
 }
 
 function findEmployee(employeeId) {
@@ -1740,16 +3098,71 @@ function findEmployee(employeeId) {
       name: "Unassigned",
       initials: "--",
       role: "",
+      email: "",
       phone: "",
+      nextOfKinName: "",
+      nextOfKinPhone: "",
+      color: "#6b7280",
       status: "Unavailable",
     }
   );
 }
 
+function sortedEmployees() {
+  return [...state.data.employees].sort((a, b) => compareEmployeeNames(a.id, b.id));
+}
+
+function compareEmployeeNames(employeeIdA, employeeIdB) {
+  return findEmployee(employeeIdA).name.localeCompare(findEmployee(employeeIdB).name, undefined, {
+    numeric: true,
+    sensitivity: "base",
+  });
+}
+
+function colorForEmployee(employeeId) {
+  const value = String(employeeId || "");
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash * 31 + value.charCodeAt(index)) % employeeColorPalette.length;
+  }
+  return employeeColorPalette[hash] || employeeColorPalette[0];
+}
+
+function softColor(color) {
+  const hex = normalizeColor(color);
+  if (!hex) return "#eaf1ff";
+  const red = parseInt(hex.slice(1, 3), 16);
+  const green = parseInt(hex.slice(3, 5), 16);
+  const blue = parseInt(hex.slice(5, 7), 16);
+  return `rgba(${red}, ${green}, ${blue}, 0.12)`;
+}
+
+function normalizeColor(color) {
+  const value = String(color || "").trim();
+  return /^#[0-9a-f]{6}$/i.test(value) ? value : "";
+}
+
+function normalizeEmail(email) {
+  return String(email || "").trim().toLowerCase();
+}
+
 function shiftsForDate(dateKey) {
   return state.data.shifts
     .filter((shift) => shift.date === dateKey)
-    .sort((a, b) => a.start.localeCompare(b.start));
+    .filter(canSeeShift)
+    .filter((shift) => state.scheduleEmployeeFilterId === "all" || shift.employeeId === state.scheduleEmployeeFilterId)
+    .sort((a, b) => compareEmployeeNames(a.employeeId, b.employeeId) || a.start.localeCompare(b.start) || a.end.localeCompare(b.end));
+}
+
+function weekShifts() {
+  const start = toDateKey(state.weekStart);
+  const end = toDateKey(addDays(state.weekStart, 7));
+  return state.data.shifts.filter((shift) => shift.date >= start && shift.date < end);
+}
+
+function canSeeShift(shift) {
+  if (isAdmin()) return true;
+  return shift.published;
 }
 
 function inferAreas(data, fallbackAreas) {
@@ -1809,6 +3222,15 @@ function addDays(date, days) {
   return copy;
 }
 
+function daysBetween(startDate, endDate) {
+  const oneDay = 24 * 60 * 60 * 1000;
+  const start = new Date(startDate);
+  const end = new Date(endDate);
+  start.setHours(0, 0, 0, 0);
+  end.setHours(0, 0, 0, 0);
+  return Math.round((end - start) / oneDay);
+}
+
 function toDateKey(date) {
   const copy = new Date(date);
   const year = copy.getFullYear();
@@ -1835,6 +3257,14 @@ function formatDateShort(date) {
   return new Intl.DateTimeFormat("en-AU", {
     day: "numeric",
     month: "short",
+  }).format(new Date(date));
+}
+
+function formatDateFull(date) {
+  return new Intl.DateTimeFormat("en-AU", {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
   }).format(new Date(date));
 }
 
