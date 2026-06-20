@@ -868,17 +868,18 @@ function renderSchedule() {
           <button data-week="0" class="active" type="button">${rangeLabel}</button>
           <button data-week="1" type="button">Next</button>
         </div>
-        ${
-          isScheduleAdmin()
-            ? `<div class="toolbar">
-                <button class="ghost-button" data-action="copy-week" type="button">Copy week</button>
-                <button class="ghost-button" data-action="paste-week" type="button" ${copiedWeekCount ? "" : "disabled"}>Paste week</button>
-                <button class="ghost-button" data-action="publish-week" type="button" ${publishDisabled ? "disabled" : ""}>${state.publishingWeek ? "Publishing..." : "Publish week"}</button>
-                <button class="primary-button" data-action="new-shift" type="button">New shift</button>
-              </div>`
-            : ""
-        }
       </div>
+
+      ${
+        isScheduleAdmin()
+          ? `<div class="schedule-actions" aria-label="Schedule actions">
+              <button class="ghost-button" data-action="copy-week" type="button">Copy week</button>
+              <button class="ghost-button" data-action="paste-week" type="button" ${copiedWeekCount ? "" : "disabled"}>Paste week</button>
+              <button class="ghost-button" data-action="publish-week" type="button" ${publishDisabled ? "disabled" : ""}>${state.publishingWeek ? "Publishing..." : "Publish week"}</button>
+              <button class="primary-button" data-action="new-shift" type="button">New shift</button>
+            </div>`
+          : ""
+      }
 
       <div class="filter-strip" aria-label="Schedule staff filter">
         <button class="mini-button ${state.scheduleEmployeeFilterId === "all" ? "active" : ""}" data-schedule-filter="all" type="button">All staff</button>

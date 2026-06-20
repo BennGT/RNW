@@ -3,11 +3,11 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="theme-color" content="#101820" />
+    <meta name="theme-color" content="#a33a24" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
-    <meta name="apple-mobile-web-app-title" content="Marshal" />
+    <meta name="apple-mobile-web-app-title" content="Sherif" />
     <meta name="mobile-web-app-capable" content="yes" />
-    <title>Marshal</title>
+    <title>Sherif</title>
     <link rel="icon" type="image/png" href="assets/rnw-logo.png" />
     <link rel="apple-touch-icon" href="assets/marshal-icon-192.png" />
     <link rel="manifest" href="manifest.webmanifest" />
@@ -19,9 +19,9 @@
         <div class="auth-logo" aria-hidden="true">
           <img src="assets/rnw-logo.png" alt="" />
         </div>
-        <p class="eyebrow">Marshal</p>
+        <p class="eyebrow">Sherif</p>
         <h1 id="authTitle">Sign in</h1>
-        <p class="auth-copy" id="authIntro">Use your Marshal email and password.</p>
+        <p class="auth-copy" id="authIntro">Use your Sherif email and password.</p>
         <form class="form-stack" id="authForm">
           <label class="auth-name-field hidden" id="authNameField">
             Name
@@ -42,60 +42,63 @@
     </div>
 
     <div class="app-shell">
-      <aside class="sidebar" aria-label="Main">
+      <aside class="sidebar" id="appMenu" aria-label="Main">
         <div class="brand">
           <div class="brand-mark" aria-hidden="true">
             <img id="brandLogo" src="assets/rnw-logo.png" alt="" />
             <span id="brandFallback">M</span>
           </div>
           <div>
-            <strong id="brandName">Marshal</strong>
+            <strong id="brandName">Sherif</strong>
             <span id="brandSubtitle">Rock N Water Landscapes</span>
           </div>
         </div>
 
         <nav class="nav-tabs" id="navTabs" aria-label="Workspace views">
           <button class="nav-tab active" data-view="dashboard" type="button">
-            <span class="nav-icon" aria-hidden="true">01</span>
-            Today
+            Home
           </button>
           <button class="nav-tab" data-view="schedule" type="button">
-            <span class="nav-icon" aria-hidden="true">02</span>
             Schedule
           </button>
           <button class="nav-tab" data-view="messages" type="button">
-            <span class="nav-icon" aria-hidden="true">03</span>
             Messages
           </button>
           <button class="nav-tab" data-view="staff" type="button">
-            <span class="nav-icon" aria-hidden="true">04</span>
             Staff
           </button>
+          <button class="nav-tab" data-view="requests" type="button">
+            Requests
+          </button>
+          <button class="nav-tab" data-view="mydetails" type="button">
+            My details
+          </button>
           <button class="nav-tab" data-view="setup" type="button">
-            <span class="nav-icon" aria-hidden="true">05</span>
-            Setup
+            Account
           </button>
         </nav>
 
-        <div class="user-switcher">
-          <label for="userSelect">Employee view</label>
-          <select id="userSelect"></select>
+        <div class="menu-actions">
+          <div class="account-pill" id="accountStatus">Signed out</div>
+          <button class="ghost-button" id="signOutButton" type="button">Sign out</button>
+          <button class="ghost-button" id="installAppButton" type="button">Install app</button>
+          <button class="ghost-button" id="notificationButton" type="button">Enable notifications</button>
         </div>
+
       </aside>
 
       <main class="main-panel">
         <header class="topbar">
-          <div>
-            <p class="eyebrow" id="todayLabel"></p>
-            <h1 id="viewTitle">Today</h1>
-          </div>
-          <div class="topbar-actions">
-            <div class="save-status" id="saveStatus" role="status" aria-live="polite">Saved locally</div>
-            <div class="account-pill" id="accountStatus">Signed out</div>
-            <button class="ghost-button" id="signOutButton" type="button">Sign out</button>
-            <button class="ghost-button" id="installAppButton" type="button">Install app</button>
-            <button class="ghost-button" id="notificationButton" type="button">Enable notifications</button>
-            <button class="ghost-button" id="seedReset" type="button">Clear data</button>
+          <div class="topbar-title">
+            <button class="menu-button" id="menuButton" type="button" aria-label="Open menu">
+              <span aria-hidden="true"></span>
+              <span aria-hidden="true"></span>
+              <span aria-hidden="true"></span>
+            </button>
+            <div>
+              <p class="eyebrow" id="todayLabel"></p>
+              <h1 id="viewTitle">Home</h1>
+            </div>
           </div>
         </header>
 
@@ -139,6 +142,10 @@
               <option value="Open">Open</option>
             </select>
           </label>
+          <label class="check-field">
+            <input name="published" type="checkbox" />
+            Published to employees
+          </label>
         </div>
 
         <label class="full-field">
@@ -174,8 +181,24 @@
             <input name="role" type="text" required />
           </label>
           <label>
+            Email
+            <input name="email" type="email" autocomplete="email" />
+          </label>
+          <label>
             Phone
             <input name="phone" type="tel" />
+          </label>
+          <label>
+            Next of kin
+            <input name="nextOfKinName" type="text" autocomplete="off" />
+          </label>
+          <label>
+            Next of kin phone
+            <input name="nextOfKinPhone" type="tel" />
+          </label>
+          <label>
+            Schedule colour
+            <input name="color" type="color" value="#276ef1" />
           </label>
           <label>
             Status

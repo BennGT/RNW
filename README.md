@@ -1,33 +1,39 @@
-# Marshal
+# Sherif
 
-Marshal is a browser-based workforce app for Rock N Water Landscapes schedules, staff requests, and internal messages.
+Sherif is a browser-based workforce app for Rock N Water Landscapes schedules, staff requests, and internal messages.
 
-Open `index.html` in a browser to run it locally. When hosted on Netlify with Functions enabled, staff, schedules, requests, messages, setup changes, and channels sync through the hosted shared data store. If the cloud store is unavailable, Marshal falls back to saving on the current device.
+Open `index.html` in a browser to run it locally. When hosted on Netlify with Functions enabled, staff, schedules, requests, messages, setup changes, and invites sync through the hosted shared data store. If the cloud store is unavailable, Sherif falls back to saving on the current device.
 
 ## Included
 
 - Today dashboard with coverage, open shifts, pending requests, and weekly roster totals.
 - Weekly schedule with create, edit, delete, copy, and paste shift actions.
-- Team message channels for announcements, operations, and managers.
+- Single team messaging channel with individual message deletion.
 - Staff directory with add, edit, and delete employee actions.
 - Employee records use name, initials, role, phone, and status.
 - Simple leave, availability, and shift-swap requests with editable statuses.
-- Setup page for business name, sidebar label, work areas, and message channels.
+- Setup page for business name, sidebar label, work areas, and invitations.
 - Backup export and import from the Setup page.
 - Installable phone app support through a web app manifest and service worker.
 - Browser notifications for saved shifts, staff updates, messages, and requests on the current device.
 - Shared Netlify cloud data storage so PC and phone edits can sync through the hosted site.
 - Email and password sign-in with a first-run owner account and admin-created employee accounts.
+- Admin and employee permissions, with employees limited to their published shifts, messages, and own requests.
+- Published schedule workflow so draft roster changes stay hidden until an admin publishes them.
+- Password change and admin password reset.
+- Invite links that let employees choose their own password, with pending/accepted status visible to admins.
+- Individual staff schedule filtering from the Schedule page or each Staff card.
+- Optional Web Push notification support through Netlify Functions.
 
 ## Phone install and notifications
 
-Marshal can be installed on phones once it is served over `https://` or from `localhost` during testing. Use the **Install app** button where supported, or use the browser menu to add it to the home screen.
+Sherif can be installed on phones once it is served over `https://` or from `localhost` during testing. Use the **Install app** button where supported, or use the browser menu to add it to the home screen.
 
-The current notification support is local to the device that has Marshal open and has granted notification permission. Sending schedule and message push notifications to all employee phones requires a hosted shared backend with web push subscriptions.
+Sherif supports local browser notifications immediately after a device grants permission. It also includes optional Web Push support for phone alerts after the Netlify environment variables below are configured.
 
 ## Netlify hosting
 
-Marshal is ready to host on Netlify. For phone-to-PC syncing, deploy it through Git or the Netlify CLI so Netlify installs the `@netlify/blobs` dependency and deploys the serverless functions in `netlify/functions`.
+Sherif is ready to host on Netlify. For phone-to-PC syncing, deploy it through Git or the Netlify CLI so Netlify installs the `@netlify/blobs` dependency and deploys the serverless functions in `netlify/functions`.
 
 Best option for shared saving:
 
@@ -44,6 +50,12 @@ Required environment variables for shared saving and sign-in:
 - `MARSHAL_NETLIFY_SITE_ID`: your Netlify Project ID from **Project configuration > General > Project information**.
 - `MARSHAL_NETLIFY_TOKEN`: a Netlify personal access token from **User settings > Applications > Personal access tokens**.
 
+Optional environment variables for phone push notifications:
+
+- `MARSHAL_VAPID_PUBLIC_KEY`: public key from `npx web-push generate-vapid-keys`.
+- `MARSHAL_VAPID_PRIVATE_KEY`: private key from the same command.
+- `MARSHAL_VAPID_SUBJECT`: contact email in this format: `mailto:you@example.com`.
+
 After adding or changing environment variables, trigger a fresh deploy. If the sign-in page still reports a service error, open `https://your-site-name.netlify.app/.netlify/functions/auth` and check the JSON error detail.
 
 Static upload option:
@@ -52,9 +64,11 @@ Manual folder upload can show the app, but shared PC-to-phone saving may not wor
 
 ## Sign-in
 
-On the first hosted visit, Marshal asks you to create the owner account. After that, everyone must sign in with email and password.
+On the first hosted visit, Sherif asks you to create the owner account. After that, everyone must sign in with email and password.
 
-The owner/admin can create employee login accounts from **Setup > Login accounts**. Passwords are hashed in the Netlify Function before being stored. The sign-in and shared data Functions use Netlify's newer `.mjs` Function format so Netlify Blobs is available in production.
+The owner/admin can create invite links from **Setup > Login accounts**. Staff use the invite link to choose their own password. Passwords are hashed in the Netlify Function before being stored. Staff can change their own password from **Setup > Password**, and admins can reset passwords from **Setup > Login accounts**.
+
+Use the same email address for the employee's login account and their Staff profile. That link lets Sherif show employees only their published shifts and their own requests.
 
 ## Good next steps
 

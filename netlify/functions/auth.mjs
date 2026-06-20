@@ -15,15 +15,23 @@ export default async function handler(request) {
     }
 
     const store = getMarshalStore("marshal-auth");
+    const url = new URL(request.url);
 
     if (request.method === "GET") {
+      const inviteToken = url.searchParams.get("invite");
+      if (inviteToken) {
+        return getInvite(store, inviteToken);
+      }
+
       const users = await getUsers(store);
+      const invites = await getInvites(store);
       const user = await getAuthenticatedUser(store, request.headers.get("authorization"));
 
       return json(200, {
         user,
         setupRequired: users.length === 0,
-        users: user?.role === "admin" ? publicUsers(users) : [],
+        users: isOwnerAdmin(user) ? publicUsers(users) : [],
+        invites: isOwnerAdmin(user) ? publicInvites(invites) : [],
       });
     }
 
@@ -33,6 +41,7 @@ export default async function handler(request) {
 
     const body = await request.json().catch(() => ({}));
     const action = body.action;
+    const dataStore = getMarshalStore("marshal");
 
     if (action === "setup") {
       return setupOwner(store, body);
@@ -42,6 +51,10 @@ export default async function handler(request) {
       return login(store, body);
     }
 
+    if (action === "accept-invite") {
+      return acceptInvite(store, dataStore, body);
+    }
+
     if (action === "logout") {
       const token = readBearerToken(request.headers.get("authorization"));
       if (token) await store.delete(`session:${token}`);
@@ -49,7 +62,15 @@ export default async function handler(request) {
     }
 
     const currentUser = await getAuthenticatedUser(store, request.headers.get("authorization"));
-    if (!currentUser || currentUser.role !== "admin") {
+    if (!currentUser) {
+      return json(403, { error: "Sign in required" });
+    }
+
+    if (action === "change-password") {
+      return changePassword(store, body, currentUser);
+    }
+
+    if (!isOwnerAdmin(currentUser)) {
       return json(403, { error: "Admin access required" });
     }
 
@@ -57,8 +78,20 @@ export default async function handler(request) {
       return createUser(store, body);
     }
 
+    if (action === "create-invite") {
+      return createInvite(store, body, currentUser);
+    }
+
     if (action === "delete-user") {
       return deleteUser(store, body, currentUser);
+    }
+
+    if (action === "delete-invite") {
+      return deleteInvite(store, body);
+    }
+
+    if (action === "reset-password") {
+      return resetPassword(store, body);
     }
 
     return json(400, { error: "Unknown action" });
@@ -112,7 +145,7 @@ async function login(store, body) {
   }
 
   const token = await createSession(store, user.id);
-  return json(200, { token, user: publicUser(user), users: user.role === "admin" ? publicUsers(users) : [] });
+  return json(200, { token, user: publicUser(user), users: isOwnerAdmin(user) ? publicUsers(users) : [] });
 }
 
 async function createUser(store, body) {
@@ -123,12 +156,166 @@ async function createUser(store, body) {
     return json(409, { error: "Email is already in use" });
   }
 
-  const user = makeUser(body, body.role === "admin" ? "admin" : "employee");
+  const user = makeUser(body, normalizeRole(body.role));
   user.password = hashPassword(assertPassword(body.password));
   users.push(user);
   await setUsers(store, users);
 
   return json(200, { user: publicUser(user), users: publicUsers(users) });
+}
+
+async function createInvite(store, body, currentUser) {
+  const users = await getUsers(store);
+  const invites = await getInvites(store);
+  const email = normalizeEmail(body.email);
+  const phone = String(body.phone || "").trim();
+  const name = String(body.name || "").trim();
+
+  if (!name) throw new Error("Name is required");
+  if (!email && !phone) throw new Error("Email or phone is required");
+  if (email && !email.includes("@")) throw new Error("Valid email is required");
+  if (email && users.some((user) => user.email === email)) {
+    return json(409, { error: "A login account already exists for this email" });
+  }
+
+  const pendingInvite = invites.find((invite) => !invite.acceptedAt && ((email && invite.email === email) || (phone && invite.phone === phone)));
+  if (pendingInvite) return json(200, { invite: publicInvite(pendingInvite), invites: publicInvites(invites) });
+
+  const invite = {
+    id: crypto.randomUUID(),
+    token: crypto.randomBytes(24).toString("hex"),
+    name,
+    email,
+    phone,
+    role: normalizeRole(body.role),
+    createdAt: new Date().toISOString(),
+    createdBy: currentUser.id,
+    acceptedAt: null,
+    acceptedUserId: null,
+  };
+
+  invites.unshift(invite);
+  await setInvites(store, invites);
+  return json(200, { invite: publicInvite(invite), invites: publicInvites(invites) });
+}
+
+async function getInvite(store, token) {
+  const invites = await getInvites(store);
+  const invite = invites.find((item) => item.token === token);
+  if (!invite) return json(404, { error: "Invite link not found" });
+
+  return json(200, {
+    invite: {
+      name: invite.name,
+      email: invite.email,
+      phone: invite.phone || "",
+      role: invite.role,
+      acceptedAt: invite.acceptedAt,
+    },
+  });
+}
+
+async function acceptInvite(store, dataStore, body) {
+  const invites = await getInvites(store);
+  const invite = invites.find((item) => item.token === body.token);
+  if (!invite) return json(404, { error: "Invite link not found" });
+  if (invite.acceptedAt) return json(409, { error: "Invite has already been used" });
+
+  const users = await getUsers(store);
+  const email = normalizeEmail(body.email || invite.email);
+  if (!email.includes("@")) return json(400, { error: "Valid email is required" });
+  if (invite.email && email !== invite.email) return json(400, { error: "Use the email address from the invite" });
+  if (users.some((user) => user.email === email)) {
+    return json(409, { error: "A login account already exists for this email" });
+  }
+
+  const user = makeUser(
+    {
+      name: body.name || invite.name,
+      email,
+      password: body.password,
+    },
+    invite.role,
+  );
+  user.password = hashPassword(assertPassword(body.password));
+  users.push(user);
+  invite.acceptedAt = new Date().toISOString();
+  invite.acceptedUserId = user.id;
+
+  await setUsers(store, users);
+  await setInvites(store, invites);
+  await upsertEmployeeFromInvite(dataStore, invite, body);
+
+  const sessionToken = await createSession(store, user.id);
+  return json(200, { token: sessionToken, user: publicUser(user), users: [], invites: [] });
+}
+
+async function upsertEmployeeFromInvite(store, invite, body) {
+  const data = (await store.get("shared-data", { type: "json" })) || {};
+  const employees = Array.isArray(data.employees) ? data.employees : [];
+  const email = normalizeEmail(body.email || invite.email);
+  const existingIndex = employees.findIndex((employee) => normalizeEmail(employee.email) === email);
+  const existing = existingIndex >= 0 ? employees[existingIndex] : {};
+  const employee = {
+    ...existing,
+    id: existing.id || crypto.randomUUID(),
+    name: existing.name || "",
+    initials: existing.initials || "",
+    role: existing.role || "Team member",
+    email,
+    phone: existing.phone || "",
+    nextOfKinName: existing.nextOfKinName || "",
+    nextOfKinPhone: existing.nextOfKinPhone || "",
+    color: existing.color || colorForText(email),
+    status: existing.status || "Available",
+    profileComplete: Boolean(existing.profileComplete),
+  };
+
+  if (existingIndex >= 0) {
+    employees[existingIndex] = employee;
+  } else {
+    employees.push(employee);
+  }
+
+  const nextData = {
+    businessName: !data.businessName || data.businessName === "Marshal" ? "Sherif" : data.businessName,
+    businessSubtitle: data.businessSubtitle || "Rock N Water Landscapes",
+    appInstalled: Boolean(data.appInstalled),
+    notificationsEnabled: Boolean(data.notificationsEnabled),
+    currentUserId: data.currentUserId || null,
+    activeChannel: "team",
+    areas: Array.isArray(data.areas) && data.areas.length ? data.areas : ["General", "Landscaping", "Maintenance", "Construction", "Admin"],
+    employees,
+    channels: [{ id: "team", name: "Team", description: "Company messages and daily updates" }],
+    shifts: Array.isArray(data.shifts) ? data.shifts : [],
+    messages: Array.isArray(data.messages) ? data.messages : [],
+    requests: Array.isArray(data.requests) ? data.requests : [],
+    savedAt: new Date().toISOString(),
+  };
+
+  await store.setJSON("shared-data", nextData);
+}
+
+function normalizeInitials(initials, name) {
+  const value = String(initials || "").trim().toUpperCase();
+  if (value) return value.slice(0, 3);
+  return String(name || "")
+    .trim()
+    .split(/\s+/)
+    .map((part) => part[0])
+    .join("")
+    .slice(0, 3)
+    .toUpperCase();
+}
+
+function colorForText(text) {
+  const palette = ["#a33a24", "#087aa3", "#d84a2a", "#211a17", "#0f766e", "#9a6700", "#7c3aed", "#be123c"];
+  const value = String(text || "");
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash * 31 + value.charCodeAt(index)) % palette.length;
+  }
+  return palette[hash] || palette[0];
 }
 
 async function deleteUser(store, body, currentUser) {
@@ -140,6 +327,40 @@ async function deleteUser(store, body, currentUser) {
   const remainingUsers = users.filter((user) => user.id !== userId);
   await setUsers(store, remainingUsers);
   return json(200, { users: publicUsers(remainingUsers) });
+}
+
+async function deleteInvite(store, body) {
+  const invites = await getInvites(store);
+  const inviteId = body.inviteId;
+  if (!inviteId) return json(400, { error: "Missing invite id" });
+
+  const remainingInvites = invites.filter((invite) => invite.id !== inviteId);
+  await setInvites(store, remainingInvites);
+  return json(200, { invites: publicInvites(remainingInvites) });
+}
+
+async function changePassword(store, body, currentUser) {
+  const users = await getUsers(store);
+  const user = users.find((item) => item.id === currentUser.id);
+  if (!user) return json(404, { error: "User not found" });
+
+  if (!verifyPassword(body.currentPassword || "", user.password)) {
+    return json(401, { error: "Current password is incorrect" });
+  }
+
+  user.password = hashPassword(assertPassword(body.newPassword));
+  await setUsers(store, users);
+  return json(200, { ok: true });
+}
+
+async function resetPassword(store, body) {
+  const users = await getUsers(store);
+  const user = users.find((item) => item.id === body.userId);
+  if (!user) return json(404, { error: "User not found" });
+
+  user.password = hashPassword(assertPassword(body.newPassword));
+  await setUsers(store, users);
+  return json(200, { users: publicUsers(users) });
 }
 
 async function createSession(store, userId) {
@@ -177,6 +398,14 @@ async function setUsers(store, users) {
   await store.setJSON("users", users);
 }
 
+async function getInvites(store) {
+  return (await store.get("invites", { type: "json" })) || [];
+}
+
+async function setInvites(store, invites) {
+  await store.setJSON("invites", invites);
+}
+
 function makeUser(body, role) {
   const name = String(body.name || "").trim();
   const email = normalizeEmail(body.email);
@@ -191,6 +420,14 @@ function makeUser(body, role) {
     role,
     createdAt: new Date().toISOString(),
   };
+}
+
+function normalizeRole(role) {
+  return ["admin", "manager"].includes(role) ? role : "employee";
+}
+
+function isOwnerAdmin(user) {
+  return user?.role === "admin";
 }
 
 function normalizeEmail(email) {
@@ -220,6 +457,23 @@ function verifyPassword(password, storedPassword) {
 
 function publicUsers(users) {
   return users.map(publicUser);
+}
+
+function publicInvites(invites) {
+  return invites.filter((invite) => !invite.acceptedAt).map(publicInvite);
+}
+
+function publicInvite(invite) {
+  return {
+    id: invite.id,
+    token: invite.token,
+    name: invite.name,
+    email: invite.email,
+    phone: invite.phone || "",
+    role: invite.role,
+    createdAt: invite.createdAt,
+    acceptedAt: invite.acceptedAt,
+  };
 }
 
 function publicUser(user) {
